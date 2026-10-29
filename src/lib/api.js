@@ -94,6 +94,8 @@ export const api = {
   getCardEvents: (id) => request(`/cards/${id}/events`),
   updateCard: (id, update) =>
     request(`/cards/${id}`, { method: "PATCH", body: JSON.stringify(update) }),
+  previewCrop: (id, imageFocus) =>
+    request(`/cards/${id}/crop-preview`, json({ image_focus: imageFocus })),
   deleteCard: (id) => request(`/cards/${id}`, { method: "DELETE" }),
   retryCard: (id) => request(`/cards/${id}/retry`, { method: "POST" }),
   cancelCard: (id) => request(`/cards/${id}/cancel`, { method: "POST" }),
@@ -107,6 +109,10 @@ export const api = {
     form.append("logo", file);
     return request(`/cards/${id}/logo`, { method: "POST", body: form });
   },
+  convertLogoToCdn: (id) => request(`/cards/${id}/logo/cdn`, { method: "POST" }),
+  /** Saves `imageFocus` (when given) and uploads the card's local images and logo to the CDN. */
+  convertToCdn: (id, imageFocus) =>
+    request(`/cards/${id}/cdn`, json(imageFocus === undefined ? {} : { image_focus: imageFocus })),
 
   approve: (ids) => request("/cards/approve", json({ ids })),
   retryCards: (ids) => request("/cards/retry", json({ ids })),

@@ -6,6 +6,7 @@ import { ConfigContext } from "./lib/config";
 import { useHashRoute } from "./lib/hooks";
 import { DashboardPage } from "./pages/Dashboard/DashboardPage";
 import { LoginPage } from "./pages/Login/LoginPage";
+import { CardDetailsPage } from "./pages/NewsCards/CardDetailsPage";
 import { CardEditPage } from "./pages/NewsCards/CardEditPage";
 import { NewsCardsPage } from "./pages/NewsCards/NewsCardsPage";
 
@@ -62,6 +63,7 @@ function Shell({ email, onSignOut }) {
         {route.name === "dashboard" && <DashboardPage />}
         {route.name === "library" && <NewsCardsPage />}
         {route.name === "card" && <CardEditPage id={route.id} />}
+        {route.name === "cardDetails" && <CardDetailsPage id={route.id} />}
       </main>
     </div>
   );

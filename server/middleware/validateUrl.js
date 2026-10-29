@@ -4,7 +4,14 @@
  * instead of rejecting the whole batch.
  */
 import { z } from "zod";
-import { CARD_STATUSES, CARD_VARIANT_KEYS, MAX_FOCUS_ZOOM } from "../../shared/types.js";
+import {
+  CARD_STATUSES,
+  CARD_VARIANT_KEYS,
+  HEX_COLOUR,
+  MAX_FOCUS_ZOOM,
+  MIN_CROP_SIZE,
+  isCropRegion,
+} from "../../shared/types.js";
 import { MAX_URL_LENGTH } from "../../shared/urlUtils.js";
 import { HttpError } from "../lib/errors.js";
 
@@ -37,10 +44,25 @@ const focusPoint = z
     x: z.number().min(0).max(1),
     y: z.number().min(0).max(1),
     zoom: z.number().min(1).max(MAX_FOCUS_ZOOM).optional(),
+    // "contain" shows the whole image in the card, filling the leftover space; "crop" stretches
+    // the free rectangle x, y, w × h (fractions of the photo) over the whole card.
+    fit: z.enum(["contain", "crop"]).optional(),
+    w: z.number().min(MIN_CROP_SIZE).max(1).optional(),
+    h: z.number().min(MIN_CROP_SIZE).max(1).optional(),
+    // Colour around the whole image (#rrggbb); without one, the image's edge colour is used.
+    fill: z.string().regex(HEX_COLOUR, "Use a colour like #000000.").optional(),
   })
   .strict()
+  .refine((p) => (p.fit === "crop" ? isCropRegion(p) : p.w === undefined && p.h === undefined), {
+    message: "A free crop needs x, y, w and h inside the image.",
+  })
   .nullable()
   .optional();
+
+const imageFocus = z
+  .object({ large: focusPoint, medium: focusPoint, small: focusPoint })
+  .strict()
+  .nullable();
 
 export const cardUpdateSchema = z
   .object({
@@ -53,13 +75,15 @@ export const cardUpdateSchema = z
     publisher_logo_url: z.string().max(MAX_URL_LENGTH).nullable().optional(),
     // Crop per card variant (x/y 0–1, as CSS object-position; zoom ≥ 1). Only the variants sent are
     // changed; a variant set to null goes back to the automatic crop; null resets all of them.
-    image_focus: z
-      .object({ large: focusPoint, medium: focusPoint, small: focusPoint })
-      .strict()
-      .nullable()
-      .optional(),
+    image_focus: imageFocus.optional(),
   })
   .strict();
+
+/** Crops to preview (same shape as image_focus in a card update); nothing is uploaded. */
+export const cropPreviewSchema = z.object({ image_focus: imageFocus }).strict();
+
+/** Convert to CDN: optional crops to save first (same shape as image_focus in a card update). */
+export const convertToCdnSchema = z.object({ image_focus: imageFocus.optional() }).strict();
 
 const dateOnly = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD.");
 

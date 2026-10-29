@@ -6,6 +6,8 @@ import { asyncHandler } from "../middleware/errorHandler.js";
 import {
   batchSchema,
   cardUpdateSchema,
+  convertToCdnSchema,
+  cropPreviewSchema,
   exportSchema,
   idListSchema,
   idParamSchema,
@@ -248,6 +250,34 @@ export function createNewsRouter(service, options) {
     }),
   );
 
+  // Crops the three images for review without uploading; POST /cdn saves and uploads them.
+  router.post(
+    "/cards/:id/crop-preview",
+    validateParams(idParamSchema),
+    validateBody(cropPreviewSchema),
+    asyncHandler(async (_req, res) => {
+      res.json(
+        await service.previewCrop(res.locals.params.id, res.locals.body.image_focus),
+      );
+    }),
+  );
+
+  // Saves the applied crops and uploads the card's locally stored images and logo to the CDN.
+  router.post(
+    "/cards/:id/cdn",
+    validateParams(idParamSchema),
+    validateBody(convertToCdnSchema),
+    asyncHandler(async (_req, res) => {
+      res.json(
+        await service.convertToCdn(
+          res.locals.params.id,
+          res.locals.body.image_focus,
+          user(res.locals),
+        ),
+      );
+    }),
+  );
+
   router.post(
     "/cards/:id/thumbnail",
     validateParams(idParamSchema),
@@ -281,6 +311,16 @@ export function createNewsRouter(service, options) {
           req.file.buffer,
           user(res.locals),
         ),
+      );
+    }),
+  );
+
+  router.post(
+    "/cards/:id/logo/cdn",
+    validateParams(idParamSchema),
+    asyncHandler(async (_req, res) => {
+      res.json(
+        await service.convertLogoToCdn(res.locals.params.id, user(res.locals)),
       );
     }),
   );

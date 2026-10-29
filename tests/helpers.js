@@ -6,6 +6,7 @@ import sharp from "sharp";
 import { vi } from "vitest";
 import { PipelineError } from "../server/lib/errors.js";
 import { logger } from "../server/lib/logger.js";
+import { LocalDevCdnAdapter } from "../server/services/cdnAdapter.js";
 import { ImageService } from "../server/services/imageProcessor.js";
 import { MemoryRepository } from "../server/services/memoryRepository.js";
 import { NewsService } from "../server/services/newsService.js";
@@ -91,6 +92,13 @@ export async function setup(options = {}) {
     };
   });
   const cdn = { name: "test", configured: true, inputMode: "file", upload };
+  // With `localDir`, images are kept in a local store until Convert to CDN, as in the app.
+  if (options.localDir) {
+    const local = new LocalDevCdnAdapter(options.localDir, "http://localhost:8787");
+    cdn.local = local;
+    cdn.read = (url) => local.read(url);
+    cdn.isForeignUrl = (url) => local.owns(url);
+  }
   const extract = vi.fn(options.extract ?? (async () => extraction()));
 
   let service;

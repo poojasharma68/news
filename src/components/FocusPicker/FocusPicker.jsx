@@ -1,9 +1,25 @@
 import { useEffect, useRef, useState } from "react";
-import { CARD_VARIANTS, MAX_FOCUS_ZOOM, focusFor, samePoint } from "../../../shared/types.js";
+import {
+  CARD_VARIANTS,
+  MAX_FOCUS_ZOOM,
+  MIN_CROP_SIZE,
+  focusFor,
+  samePoint,
+} from "../../../shared/types.js";
 
 const round3 = (v) => Math.round(v * 1000) / 1000;
 const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
 const CENTRE = { x: 0.5, y: 0.5 };
+/** The whole image inside the card on a solid colour (see the server's containFrame). */
+const WHOLE = { x: 0.5, y: 0.5, fit: "contain" };
+const isWhole = (point) => point?.fit === "contain";
+/** A free crop: any rectangle of the photo, stretched over the whole card (server: fit "fill"). */
+const isFree = (point) => point?.fit === "crop";
+/** Quick fill choices besides the image's own edge colour. */
+const FILL_SWATCHES = [
+  { value: "#ffffff", label: "White" },
+  { value: "#000000", label: "Black" },
+];
 /** Keyboard nudge, as a share of the photo (Shift moves ten times as far). */
 const NUDGE = 0.005;
 /** Zoom change per wheel notch / per +/- key press. */
@@ -24,6 +40,8 @@ function baseBox(source, size) {
  * crops with, so the preview matches the generated image.
  */
 function cropBox(source, size, point) {
+  if (isWhole(point)) return { w: 1, h: 1, left: 0, top: 0, zoom: 1, whole: true };
+  if (isFree(point)) return { w: point.w, h: point.h, left: point.x, top: point.y, zoom: 1, free: true };
   const base = baseBox(source, size);
   const p = point ?? CENTRE;
   const zoom = p.zoom ?? 1;
@@ -54,6 +72,32 @@ function zoomAround(source, size, box, zoom) {
   return pointForBox(source, size, cx - base.w / z / 2, cy - base.h / z / 2, z);
 }
 
+/** A free crop of w × h at (left, top), kept inside the photo and at least MIN_CROP_SIZE. */
+function freePoint(left, top, w, h) {
+  const fw = round3(clamp(w, MIN_CROP_SIZE, 1));
+  const fh = round3(clamp(h, MIN_CROP_SIZE, 1));
+  return {
+    x: round3(clamp(left, 0, 1 - fw)),
+    y: round3(clamp(top, 0, 1 - fh)),
+    w: fw,
+    h: fh,
+    fit: "crop",
+  };
+}
+
+/** A free crop scaled by `factor` (above 1 = smaller box, i.e. zoom in) around its centre. */
+function zoomFree(box, factor) {
+  const s = clamp(1 / factor, MIN_CROP_SIZE / Math.min(box.w, box.h), 1 / Math.max(box.w, box.h));
+  const w = box.w * s;
+  const h = box.h * s;
+  return freePoint(box.left + (box.w - w) / 2, box.top + (box.h - h) / 2, w, h);
+}
+
+/** How much a free crop is stretched in the card: its shape's ratio to the card's (1 = none). */
+function stretchOf(source, size, box) {
+  return (box.w * source.width) / (box.h * source.height) / (size.width / size.height);
+}
+
 const WHOLE_IMAGE = { left: 0, top: 0, width: 1, height: 1 };
 
 /** Positions an image so that `region` (fractions of it) exactly fills its frame. */
@@ -61,6 +105,8 @@ function regionStyle(region) {
   return {
     position: "absolute",
     maxWidth: "none",
+    // A free crop's region can differ from the frame's shape; it is stretched, as the server does.
+    objectFit: "fill",
     width: `${100 / region.width}%`,
     height: `${100 / region.height}%`,
     left: `${(-region.left / region.width) * 100}%`,
@@ -129,6 +175,11 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
   const box = source ? cropBox(source, size, point) : null;
   const isCustom = !!customOf(active);
   const setPoint = (key, next) => setDraft((d) => ({ ...d, [key]: next }));
+  /** The image's edge colour for a card's shape, as the server measured it (null if unknown). */
+  const edgeOf = (key) => variants?.[key]?.edgeFill ?? null;
+  /** The colour around the whole image in a card: the chosen one, else the edge colour. */
+  const fillOf = (key) => shownOf(key).fill ?? edgeOf(key);
+  const setFill = (fill) => setPoint(active, fill ? { ...WHOLE, fill } : { ...WHOLE });
 
   /** Pointer position as fractions of the photo shown in the large view. */
   const photoPoint = (e) => {
@@ -140,7 +191,7 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
   };
 
   const startDrag = (e, mode, extra = {}) => {
-    if (disabled || !source || !box) return;
+    if (disabled || !source || !box || box.whole) return;
     e.preventDefault();
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -148,14 +199,16 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
   };
 
   const onStagePointerDown = (e) => {
-    if (disabled || !source || !box) return;
+    if (disabled || !source || !box || box.whole) return;
     // Pressing outside the box moves it there first, then drags it.
     const p = photoPoint(e);
     const inside =
       p.x >= box.left && p.x <= box.left + box.w && p.y >= box.top && p.y <= box.top + box.h;
     let current = box;
     if (!inside) {
-      const next = pointForBox(source, size, p.x - box.w / 2, p.y - box.h / 2, box.zoom);
+      const next = box.free
+        ? freePoint(p.x - box.w / 2, p.y - box.h / 2, box.w, box.h)
+        : pointForBox(source, size, p.x - box.w / 2, p.y - box.h / 2, box.zoom);
       setPoint(active, next);
       current = cropBox(source, size, next);
     }
@@ -168,10 +221,26 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
     if (!d || !source) return;
     const p = photoPoint(e);
     if (d.mode === "move") {
+      const left = d.box.left + p.x - d.start.x;
+      const top = d.box.top + p.y - d.start.y;
       setPoint(
         active,
-        pointForBox(source, size, d.box.left + p.x - d.start.x, d.box.top + p.y - d.start.y, d.box.zoom),
+        d.box.free
+          ? freePoint(left, top, d.box.w, d.box.h)
+          : pointForBox(source, size, left, top, d.box.zoom),
       );
+      return;
+    }
+    if (d.box.free) {
+      // A free crop resizes each dragged side on its own, keeping the opposite side in place.
+      const side = (s, a, pos, start, extent) => {
+        if (!s) return [start, extent];
+        const len = clamp((pos - a) * s, MIN_CROP_SIZE, s > 0 ? 1 - a : a);
+        return [s > 0 ? a : a - len, len];
+      };
+      const [left, w] = side(d.sx, d.ax, p.x, d.box.left, d.box.w);
+      const [top, h] = side(d.sy, d.ay, p.y, d.box.top, d.box.h);
+      setPoint(active, freePoint(left, top, w, h));
       return;
     }
     // Resizing from a corner keeps the opposite corner in place and the card's shape.
@@ -202,7 +271,24 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
     if (disabled || !source) return;
     const s = sizeOf(key);
     const current = cropBox(source, s, shownOf(key));
-    setPoint(key, zoomAround(source, s, current, current.zoom * factor));
+    if (current.whole) return;
+    setPoint(
+      key,
+      current.free ? zoomFree(current, factor) : zoomAround(source, s, current, current.zoom * factor),
+    );
+  };
+
+  /** Switches the active card to a free crop starting from the box it shows now, or back. */
+  const toggleFree = () => {
+    if (!box) return;
+    if (box.free) {
+      // Back to a card-shaped frame around the same centre, as large as fits.
+      const base = baseBox(source, size);
+      const z = Math.min(base.w / box.w, base.h / box.h);
+      setPoint(active, zoomAround(source, size, box, Math.max(1, z)));
+    } else {
+      setPoint(active, freePoint(box.left, box.top, box.w, box.h));
+    }
   };
 
   useWheel(stage, (e) => {
@@ -212,13 +298,18 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
   });
 
   const onKeyDown = (e) => {
-    if (disabled || !source || !box) return;
+    if (disabled || !source || !box || box.whole) return;
     const step = e.shiftKey ? NUDGE * 10 : NUDGE;
     const moves = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
     if (moves[e.key]) {
       e.preventDefault();
       const [dx, dy] = moves[e.key];
-      setPoint(active, pointForBox(source, size, box.left + dx, box.top + dy, box.zoom));
+      setPoint(
+        active,
+        box.free
+          ? freePoint(box.left + dx, box.top + dy, box.w, box.h)
+          : pointForBox(source, size, box.left + dx, box.top + dy, box.zoom),
+      );
     } else if (e.key === "+" || e.key === "=") {
       e.preventDefault();
       zoomBy(active, ZOOM_STEP);
@@ -234,7 +325,9 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
         <strong>Crop</strong>
         <small className="muted">
           Each card has its own crop. Drag the box to move it, drag a corner or scroll to zoom. You
-          can also drag and scroll inside a card preview.
+          can also drag and scroll inside a card preview. Free crop lets you pick any rectangle;
+          it then fills the card's full width and height. Fit whole image shows the entire image
+          centred on a solid colour.
         </small>
       </div>
 
@@ -250,7 +343,15 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
           >
             {label}
             <span className="muted small">
-              {key in changes ? " · unsaved" : customOf(key) ? " · custom" : " · automatic"}
+              {key in changes
+                ? " · unsaved"
+                : isWhole(customOf(key))
+                  ? " · whole image"
+                  : isFree(customOf(key))
+                    ? " · free crop"
+                    : customOf(key)
+                    ? " · custom"
+                    : " · automatic"}
             </span>
           </button>
         ))}
@@ -283,7 +384,7 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
             />
             {box && (
               <span
-                className={`focusWindow ${isCustom ? "" : "isAuto"}`}
+                className={`focusWindow ${isCustom ? "" : "isAuto"} ${box.whole ? "isWhole" : ""}`}
                 style={{
                   left: `${box.left * 100}%`,
                   top: `${box.top * 100}%`,
@@ -293,11 +394,21 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
               >
                 <span className="focusGrid" aria-hidden="true" />
                 {!disabled &&
+                  !box.whole &&
                   [
                     [-1, -1, "nw"],
                     [1, -1, "ne"],
                     [-1, 1, "sw"],
                     [1, 1, "se"],
+                    // A free crop's sides move on their own too.
+                    ...(box.free
+                      ? [
+                          [0, -1, "n"],
+                          [1, 0, "e"],
+                          [0, 1, "s"],
+                          [-1, 0, "w"],
+                        ]
+                      : []),
                   ].map(([sx, sy, corner]) => (
                     <span
                       key={corner}
@@ -322,7 +433,7 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
                 max={MAX_FOCUS_ZOOM}
                 step={0.01}
                 value={box?.zoom ?? 1}
-                disabled={disabled || !source}
+                disabled={disabled || !source || !!box?.whole || !!box?.free}
                 onChange={(e) => box && setPoint(active, zoomAround(source, size, box, Number(e.target.value)))}
               />
               <span className="small mono">{Math.round((box?.zoom ?? 1) * 100)}%</span>
@@ -331,11 +442,35 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
               <button
                 type="button"
                 className="btn btnSmall"
-                disabled={disabled || !box || (box.zoom === 1 && point.x === 0.5 && point.y === 0.5)}
+                disabled={
+                  disabled ||
+                  !box ||
+                  (!box.whole && !box.free && box.zoom === 1 && point.x === 0.5 && point.y === 0.5)
+                }
                 onClick={() => setPoint(active, { ...CENTRE })}
                 title="Largest box, centred"
               >
                 Fit &amp; centre
+              </button>
+              <button
+                type="button"
+                className={`btn btnSmall ${box?.free ? "btnPrimary" : ""}`}
+                aria-pressed={!!box?.free}
+                disabled={disabled || !box || box.whole}
+                onClick={toggleFree}
+                title="Crop any rectangle of the image; it is stretched to fill the card's full width and height."
+              >
+                Free crop
+              </button>
+              <button
+                type="button"
+                className={`btn btnSmall ${box?.whole ? "btnPrimary" : ""}`}
+                aria-pressed={!!box?.whole}
+                disabled={disabled || !box}
+                onClick={() => setPoint(active, box.whole ? { ...CENTRE } : { ...WHOLE })}
+                title="Show the entire image in this card without cropping, on a solid colour."
+              >
+                Fit whole image
               </button>
               <button
                 type="button"
@@ -348,6 +483,60 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
               </button>
             </div>
           </div>
+          {box?.free && source && (
+            <FreeCropInfo
+              stretch={stretchOf(source, size, box)}
+              disabled={disabled}
+              onMatch={() => {
+                // The largest card-shaped box inside the free crop, around its centre.
+                const k = stretchOf(source, size, box);
+                const w = k > 1 ? box.w / k : box.w;
+                const h = k > 1 ? box.h : box.h * k;
+                setPoint(active, freePoint(box.left + (box.w - w) / 2, box.top + (box.h - h) / 2, w, h));
+              }}
+            />
+          )}
+          {box?.whole && (
+            <div className="focusFill" role="group" aria-label="Colour around the image">
+              <span className="small">Background</span>
+              <button
+                type="button"
+                className={`fillChip ${point.fill ? "" : "isSelected"}`}
+                aria-pressed={!point.fill}
+                disabled={disabled}
+                onClick={() => setFill(null)}
+                title="The colour of the image's own edges"
+              >
+                <span className="fillSwatch" style={{ background: edgeOf(active) ?? undefined }} />
+                Edge colour
+              </button>
+              {FILL_SWATCHES.map(({ value, label }) => (
+                <button
+                  key={value}
+                  type="button"
+                  className={`fillChip ${point.fill === value ? "isSelected" : ""}`}
+                  aria-pressed={point.fill === value}
+                  disabled={disabled}
+                  onClick={() => setFill(value)}
+                >
+                  <span className="fillSwatch" style={{ background: value }} />
+                  {label}
+                </button>
+              ))}
+              <label
+                className={`fillChip ${point.fill && !FILL_SWATCHES.some((f) => f.value === point.fill) ? "isSelected" : ""}`}
+                title="Pick any colour"
+              >
+                <input
+                  type="color"
+                  value={fillOf(active) ?? "#ffffff"}
+                  disabled={disabled}
+                  onChange={(e) => setFill(e.target.value.toLowerCase())}
+                />
+                Custom
+              </label>
+            </div>
+          )}
         </div>
 
         <div className="focusCrops">
@@ -361,6 +550,9 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
               imageUrl={imageUrl}
               generated={variants?.[key]?.url}
               region={source ? inOriginal(cropBox(source, sizeOf(key), shownOf(key))) : null}
+              content={content}
+              whole={isWhole(shownOf(key))}
+              fill={fillOf(key)}
               // Unsaved crops are previewed in CSS; otherwise show the image the server made.
               live={key in changes || !variants?.[key]?.url}
               approx={!customOf(key) && !autoOf(key)}
@@ -370,7 +562,15 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
                 const s = sizeOf(key);
                 const current = cropBox(source, s, shownOf(key));
                 // Dragging the picture right shows more of its left side: the box moves left.
-                setPoint(key, pointForBox(source, s, current.left - dx * current.w, current.top - dy * current.h, current.zoom));
+                if (current.whole) return;
+                const left = current.left - dx * current.w;
+                const top = current.top - dy * current.h;
+                setPoint(
+                  key,
+                  current.free
+                    ? freePoint(left, top, current.w, current.h)
+                    : pointForBox(source, s, left, top, current.zoom),
+                );
               }}
               onZoom={(factor) => zoomBy(key, factor)}
             />
@@ -386,7 +586,7 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
           onClick={() => onApply(changes)}
         >
           {busy
-            ? "Re-cropping…"
+            ? "Cropping…"
             : `Apply ${changedCount > 1 ? `${changedCount} crops` : "crop"}`}
         </button>
         {changedCount > 0 && (
@@ -411,8 +611,34 @@ export function FocusPicker({ imageUrl, focus, variants, sizes, disabled, busy, 
             All cards automatic
           </button>
         )}
-        <small className="muted">Applying re-creates the changed images and needs approval again.</small>
+        <small className="muted">Applying shows the crops in the card outputs below; Convert to CDN uploads them.</small>
       </div>
+    </div>
+  );
+}
+
+/**
+ * How much a free crop is stretched to fill the card, with a button that trims it to the card's
+ * shape so nothing is distorted.
+ */
+function FreeCropInfo({ stretch, disabled, onMatch }) {
+  const off = Math.abs(Math.log(stretch)) > Math.log(1.02);
+  return (
+    <div className="focusFreeInfo small">
+      {off ? (
+        <span className="muted">
+          Fills the card by stretching the crop{" "}
+          {stretch > 1 ? "vertically" : "horizontally"}{" "}
+          <span className="mono">{(stretch > 1 ? stretch : 1 / stretch).toFixed(2)}×</span>.
+        </span>
+      ) : (
+        <span className="muted">Matches the card's shape; nothing is stretched.</span>
+      )}
+      {off && (
+        <button type="button" className="btn btnSmall btnGhost" disabled={disabled} onClick={onMatch}>
+          Match card shape
+        </button>
+      )}
     </div>
   );
 }
@@ -426,6 +652,9 @@ function CropPreview({
   imageUrl,
   generated,
   region,
+  content,
+  whole,
+  fill,
   live,
   approx,
   disabled,
@@ -466,17 +695,43 @@ function CropPreview({
       >
         {live || !generated ? (
           source &&
-          region && (
+          region &&
+          (whole ? (
+            <WholePreview size={size} source={source} imageUrl={imageUrl} content={content} fill={fill} />
+          ) : (
             <img src={imageUrl} alt="" referrerPolicy="no-referrer" draggable={false} style={regionStyle(region)} />
-          )
+          ))
         ) : (
           <img src={generated} alt="" referrerPolicy="no-referrer" draggable={false} />
         )}
       </span>
       <button type="button" className="focusCropLabel muted small" onClick={onSelect}>
         {label}
-        {live && approx && " (approx.)"}
+        {live && (approx || (whole && !fill)) && " (approx.)"}
       </button>
     </div>
+  );
+}
+
+/**
+ * The whole image centred in a card on a solid colour, as the server makes it. Images processed
+ * before edge colours were recorded show white until the crop is applied.
+ */
+function WholePreview({ size, source, imageUrl, content, fill }) {
+  const frameRatio = size.width / size.height;
+  const sourceRatio = source.width / source.height;
+  // The photo's box inside the card, in % of the card.
+  const w = sourceRatio > frameRatio ? 100 : (sourceRatio / frameRatio) * 100;
+  const h = sourceRatio > frameRatio ? (frameRatio / sourceRatio) * 100 : 100;
+  return (
+    <>
+      <span className="focusWholeFill" style={{ background: fill ?? "#ffffff" }} />
+      <span
+        className="focusWholePhoto"
+        style={{ width: `${w}%`, height: `${h}%`, left: `${(100 - w) / 2}%`, top: `${(100 - h) / 2}%` }}
+      >
+        <img src={imageUrl} alt="" referrerPolicy="no-referrer" draggable={false} style={regionStyle(content)} />
+      </span>
+    </>
   );
 }

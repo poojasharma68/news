@@ -430,6 +430,47 @@ fieldset {
   margin: 8px 0 0;
   padding-left: 20px;
 }
+.callout ol li + li {
+  margin-top: 6px;
+}
+.bookmarklet {
+  cursor: grab;
+}
+.bookmarkSetup {
+  margin: 10px 0;
+  padding: 8px 10px;
+  border: 1px dashed #e0b866;
+  border-radius: var(--radius-sm);
+  background: #fff;
+}
+.bookmarkSetup summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.bookmarkSetup p {
+  margin: 8px 0 0;
+}
+.bookmarkSetup kbd {
+  padding: 1px 5px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #f7f7f7;
+  font-size: 0.8rem;
+}
+.verifySteps {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0 6px;
+}
+.linkButton {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
 .calloutWarning {
   background: var(--warning-bg);
   border-color: #f2d49b;
@@ -922,9 +963,37 @@ fieldset {
 
 .editorLayout {
   display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 20px;
   align-items: start;
+}
+/* Details & history page: the two panels side by side. */
+.detailsLayout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .detailsLayout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+/* Where an output image is stored: on this server until Convert to CDN, then on the CDN. */
+.storageTag {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.storageTag.isLocal {
+  background: #fff4d6;
+  color: #8a5a00;
+}
+.storageTag.isCdn {
+  background: #e3f6e8;
+  color: #1d6b35;
 }
 .editorSide {
   display: flex;
@@ -1063,6 +1132,36 @@ fieldset {
   bottom: -8px;
   cursor: nwse-resize;
 }
+/* Side handles of a free crop. */
+.focusHandle.is-n,
+.focusHandle.is-s {
+  left: calc(50% - 7px);
+  cursor: ns-resize;
+}
+.focusHandle.is-n {
+  top: -8px;
+}
+.focusHandle.is-s {
+  bottom: -8px;
+}
+.focusHandle.is-e,
+.focusHandle.is-w {
+  top: calc(50% - 7px);
+  cursor: ew-resize;
+}
+.focusHandle.is-e {
+  right: -8px;
+}
+.focusHandle.is-w {
+  left: -8px;
+}
+.focusFreeInfo {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
 .focusSource:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
@@ -1120,6 +1219,55 @@ fieldset {
   user-select: none;
 }
 /* Drag the picture inside a card preview to move it, as when moving an image in a Figma frame. */
+.focusWholeFill {
+  position: absolute;
+  inset: 0;
+}
+.focusFill {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+.fillChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+.fillChip.isSelected {
+  border-color: currentColor;
+  font-weight: 600;
+}
+.fillChip:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.fillSwatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: repeating-conic-gradient(#ddd 0 25%, #fff 0 50%) 0 0 / 8px 8px;
+}
+.fillChip input[type="color"] {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+.focusWholePhoto {
+  position: absolute;
+  overflow: hidden;
+}
 .focusCropFrame.isDraggable {
   cursor: grab;
 }
@@ -1527,4 +1675,20 @@ fieldset {
   .workflowSteps {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+/* CDN links under each card output */
+.cdnLinks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cdnLink {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+.cdnLink .btn {
+  align-self: center;
 }

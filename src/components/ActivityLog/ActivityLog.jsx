@@ -9,6 +9,8 @@ const EVENT_LABELS = {
   blocked: "Blocked by publisher",
   duplicate: "Marked as duplicate",
   images_uploaded: "Images uploaded to the CDN",
+  images_ready: "Images ready (stored locally)",
+  converted_to_cdn: "Converted to the CDN",
   job_finished: "Processing finished",
   retry_scheduled: "Retry scheduled",
   job_failed: "Processing failed",

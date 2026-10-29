@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ACTIVE_STATUSES,
   FIELD_LABELS,
+  MAX_BLOCKED_ATTEMPTS,
   PROCESSING_STAGES,
   RETRYABLE_STATUSES,
   STAGE_LABELS,
@@ -31,7 +32,7 @@ function cardMessage(card) {
   if (card.status === "verification_required") {
     return {
       tone: "warning",
-      text: `${card.verification_reason ?? "The publisher blocked automated access."} Open the article and complete the card manually.`,
+      text: `${card.verification_reason ?? "The publisher blocked automated access."} Retrying will not get past it: click Complete, solve the check in your browser and send the article details with the bookmark.`,
     };
   }
   if (card.error_message)
@@ -278,7 +279,11 @@ export function ProcessingQueue({
                     )}
                   </div>
                   <div className="queueActions">
-                    {RETRYABLE_STATUSES.includes(card.status) && (
+                    {RETRYABLE_STATUSES.includes(card.status) &&
+                      !(
+                        card.status === "verification_required" &&
+                        card.attempts >= MAX_BLOCKED_ATTEMPTS
+                      ) && (
                       <button
                         type="button"
                         className="btn btnSmall"

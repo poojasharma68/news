@@ -18,6 +18,7 @@
     "playwright:install": "playwright install chromium"
   },
   "dependencies": {
+    "@masters-union/union-stack": "^1.1.2",
     "@supabase/supabase-js": "^2.45.4",
     "cheerio": "^1.0.0",
     "cors": "^2.8.5",

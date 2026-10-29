@@ -124,16 +124,48 @@ export const PRIMARY_VARIANT = "large";
 /** Largest crop zoom: the crop box can shrink to 1/MAX_FOCUS_ZOOM of the largest box that fits. */
 export const MAX_FOCUS_ZOOM = 6;
 
+/** A fill colour for "Fit whole image", as #rrggbb. */
+export const HEX_COLOUR = /^#[0-9a-f]{6}$/;
+
+/** Smallest side of a free crop, as a share of the photo. */
+export const MIN_CROP_SIZE = 0.05;
+
+/** A free crop: any rectangle of the photo (fractions), stretched to fill the whole card. */
+export function isCropRegion(point) {
+  const ok = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
+  const size = (v) => ok(v) && v >= MIN_CROP_SIZE;
+  return (
+    point?.fit === "crop" &&
+    ok(point.x) &&
+    ok(point.y) &&
+    size(point.w) &&
+    size(point.h) &&
+    point.x + point.w <= 1.0005 &&
+    point.y + point.h <= 1.0005 &&
+    point.zoom === undefined &&
+    point.fill === undefined
+  );
+}
+
 function isFocusPoint(point) {
+  if (point?.fit === "crop") return isCropRegion(point);
   const ok = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
   const zoomOk =
     point?.zoom === undefined ||
     (typeof point.zoom === "number" && point.zoom >= 1 && point.zoom <= MAX_FOCUS_ZOOM);
-  return !!point && ok(point.x) && ok(point.y) && zoomOk;
+  const fitOk =
+    (point?.fit === undefined && point?.fill === undefined) ||
+    (point?.fit === "contain" && (point.fill === undefined || HEX_COLOUR.test(point.fill)));
+  return !!point && ok(point.x) && ok(point.y) && zoomOk && fitOk;
 }
 
 /** A copy of a valid point; zoom is left out at 1 (the largest box), so old and new records match. */
 function cleanPoint(point) {
+  // The whole image is shown centred, so position and zoom do not apply.
+  // fill is the colour around it; without one, the colour of the image's own edges is used.
+  if (point.fit === "contain")
+    return { x: 0.5, y: 0.5, fit: "contain", ...(point.fill && { fill: point.fill }) };
+  if (point.fit === "crop") return { x: point.x, y: point.y, w: point.w, h: point.h, fit: "crop" };
   return point.zoom > 1 ? { x: point.x, y: point.y, zoom: point.zoom } : { x: point.x, y: point.y };
 }
 
@@ -141,8 +173,11 @@ function cleanPoint(point) {
  * The crop of one variant. `image_focus` holds one per variant
  * ({ large: { x, y, zoom? }, medium: …, small: … }); a variant without one uses the automatic crop.
  * x/y place the crop box like CSS object-position (0–1); zoom (1–MAX_FOCUS_ZOOM) shrinks the box
- * from the largest one that fits, as in Figma's crop mode. A single { x, y } (older records)
- * applies to every variant.
+ * from the largest one that fits, as in Figma's crop mode. { fit: "contain" } shows the whole
+ * image instead, on a solid colour (`fill`, #rrggbb; the image's edge colour when left out).
+ * { fit: "crop", x, y, w, h } is a free crop: the rectangle at left x, top y, w × h (fractions of
+ * the photo) is stretched to fill the card's full width and height. A single { x, y } (older
+ * records) applies to every variant.
  */
 export function focusFor(imageFocus, variant) {
   if (!imageFocus) return null;
@@ -162,7 +197,15 @@ export function mergeFocus(current, changes) {
 }
 
 export function samePoint(p, q) {
-  return p?.x === q?.x && p?.y === q?.y && (p?.zoom ?? 1) === (q?.zoom ?? 1);
+  return (
+    p?.x === q?.x &&
+    p?.y === q?.y &&
+    (p?.zoom ?? 1) === (q?.zoom ?? 1) &&
+    p?.w === q?.w &&
+    p?.h === q?.h &&
+    (p?.fit ?? "cover") === (q?.fit ?? "cover") &&
+    p?.fill === q?.fill
+  );
 }
 
 export function sameFocus(a, b) {

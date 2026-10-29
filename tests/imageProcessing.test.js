@@ -184,6 +184,117 @@ describe("focal point crop", () => {
     expect(out.cacheKey).toContain(":focus0.000,0.500,z2.000");
   });
 
+  it("fits the whole image and fills single-colour edges with that colour", async () => {
+    // A white mark on black, like a logo: 1600×900 into 400×400 is 400×225 with 88px bands.
+    const logo = await sharp({ create: { width: 1600, height: 900, channels: 3, background: "#000000" } })
+      .composite([
+        {
+          input: { create: { width: 1200, height: 500, channels: 3, background: "#ffffff" } },
+          left: 200,
+          top: 200,
+        },
+      ])
+      .png()
+      .toBuffer();
+    const svc = new ImageService(square);
+    const out = await svc.process(logo, "logo", square, { x: 0.5, y: 0.5, fit: "contain" });
+    expect([out.width, out.height]).toEqual([400, 400]);
+    expect(await pixel(out.buffer, 200, 10)).toEqual([0, 0, 0]); // band: black, not white
+    expect(await pixel(out.buffer, 200, 390)).toEqual([0, 0, 0]);
+    // The mark is not cropped: its left and right ends (x 50–350) are still in the card.
+    expect((await pixel(out.buffer, 55, 200))[0]).toBeGreaterThan(200);
+    expect((await pixel(out.buffer, 345, 200))[0]).toBeGreaterThan(200);
+    expect(out.cacheKey).toContain(":contain");
+    expect(out.auto).toBeNull();
+  });
+
+  it("fills around a whole photo with mixed edges in one solid colour, never blurred", async () => {
+    // Top and bottom rows are red on the left half and blue on the right: one colour is used.
+    const svc = new ImageService(square);
+    const out = await svc.process(await halves(), "h", square, { x: 0.5, y: 0.5, fit: "contain" });
+    expect([out.width, out.height]).toEqual([400, 400]);
+    expect((await pixel(out.buffer, 2, 200))[0]).toBeGreaterThan(200); // both ends of the photo kept
+    expect((await pixel(out.buffer, 397, 200))[2]).toBeGreaterThan(200);
+    const band = await pixel(out.buffer, 20, 10);
+    expect(await pixel(out.buffer, 380, 10)).toEqual(band); // same colour across the band
+    expect(await pixel(out.buffer, 380, 390)).toEqual(band);
+    expect(out.edgeFill).toMatch(/^#[0-9a-f]{6}$/);
+  });
+
+  it("uses the chosen background colour around the whole image", async () => {
+    const svc = new ImageService(square);
+    const out = await svc.process(await halves(), "h", square, {
+      x: 0.5,
+      y: 0.5,
+      fit: "contain",
+      fill: "#00ff00",
+    });
+    expect(await pixel(out.buffer, 200, 10)).toEqual([0, 255, 0]);
+    expect(out.cacheKey).toContain(":contain#00ff00");
+  });
+
+  it("reports the edge colour of each card shape while the image is still cropped", async () => {
+    const svc = new ImageService(square);
+    const out = await svc.process(await halves(), "h", square, null);
+    // 16:9 into a square leaves space above and below: the top/bottom rows' colour.
+    expect(out.edgeFill).toMatch(/^#[0-9a-f]{6}$/);
+    const wide = { ...square, width: 800, height: 200 };
+    const beside = await svc.process(await halves(), "h", wide, null);
+    // Space beside it: left (red) and right (blue) columns, whichever colour is most common.
+    expect(["#ff0000", "#0000ff"]).toContain(beside.edgeFill);
+  });
+
+  it("stores the whole-image fit per card without a position or zoom", () => {
+    expect(focusFor({ medium: { x: 0.1, y: 0.9, zoom: 3, fit: "contain" } }, "medium")).toEqual({
+      x: 0.5,
+      y: 0.5,
+      fit: "contain",
+    });
+    expect(focusFor({ medium: { x: 0.5, y: 0.5, fit: "fill" } }, "medium")).toBeNull();
+    expect(focusFor({ medium: { x: 0.5, y: 0.5, fit: "contain", fill: "#000000" } }, "medium")).toEqual({
+      x: 0.5,
+      y: 0.5,
+      fit: "contain",
+      fill: "#000000",
+    });
+    expect(focusFor({ medium: { x: 0.5, y: 0.5, fit: "contain", fill: "red" } }, "medium")).toBeNull();
+    expect(focusFor({ medium: { x: 0.5, y: 0.5, fill: "#000000" } }, "medium")).toBeNull();
+    expect(
+      sameFocus(
+        { medium: { x: 0.5, y: 0.5, fit: "contain", fill: "#000000" } },
+        { medium: { x: 0.5, y: 0.5, fit: "contain" } },
+      ),
+    ).toBe(false);
+    expect(sameFocus({ medium: { x: 0.5, y: 0.5, fit: "contain" } }, { medium: { x: 0.5, y: 0.5 } })).toBe(false);
+    expect(mergeFocus({ large: { x: 0, y: 0 } }, { medium: { x: 0.5, y: 0.5, fit: "contain" } })).toEqual({
+      large: { x: 0, y: 0 },
+      medium: { x: 0.5, y: 0.5, fit: "contain" },
+    });
+  });
+
+  it("stretches a free crop over the card's full width and height", async () => {
+    // The left (red) half only, 800×900 of a 1600×900 photo, fills a 400×400 card edge to edge.
+    const svc = new ImageService(square);
+    const out = await svc.process(await halves(), "h", square, { x: 0, y: 0, w: 0.5, h: 1, fit: "crop" });
+    expect([out.width, out.height]).toEqual([400, 400]);
+    for (const [x, y] of [[2, 2], [397, 2], [2, 397], [397, 397]])
+      expect((await pixel(out.buffer, x, y))[0]).toBeGreaterThan(200);
+    expect((await pixel(out.buffer, 397, 200))[2]).toBeLessThan(60); // no blue: the right half is cut
+    expect(out.cacheKey).toContain(":crop0.0000,0.0000,0.5000,1.0000");
+    expect(out.auto).toBeNull();
+  });
+
+  it("stores a free crop per card and rejects one outside the image", () => {
+    const crop = { x: 0.1, y: 0.2, w: 0.5, h: 0.3, fit: "crop" };
+    expect(focusFor({ small: { ...crop, zoom: 2 } }, "small")).toBeNull();
+    expect(focusFor({ small: crop }, "small")).toEqual(crop);
+    expect(focusFor({ small: { ...crop, x: 0.6 } }, "small")).toBeNull();
+    expect(focusFor({ small: { ...crop, w: 0.01 } }, "small")).toBeNull();
+    expect(focusFor({ small: { x: 0.1, y: 0.2, fit: "crop" } }, "small")).toBeNull();
+    expect(sameFocus({ small: crop }, { small: { ...crop, w: 0.4 } })).toBe(false);
+    expect(mergeFocus(null, { small: crop })).toEqual({ small: crop });
+  });
+
   it("keeps a zoom with the point and leaves it out at 1", () => {
     expect(focusFor({ large: { x: 0.2, y: 0.4, zoom: 2.5 } }, "large")).toEqual({ x: 0.2, y: 0.4, zoom: 2.5 });
     expect(focusFor({ large: { x: 0.2, y: 0.4, zoom: 1 } }, "large")).toEqual({ x: 0.2, y: 0.4 });

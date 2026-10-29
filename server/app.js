@@ -77,21 +77,21 @@ export function createApp({ config, service, auth, publicConfig }) {
   );
   app.use("/api", notFoundHandler);
 
-  if (config.cdn.provider === "local-dev") {
-    app.use(
-      "/dev-cdn",
-      (_req, res, next) => {
-        res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-        next();
-      },
-      express.static(path.resolve(config.cdn.localDir), {
-        immutable: true,
-        maxAge: "30d",
-        index: false,
-        dotfiles: "deny",
-      }),
-    );
-  }
+  // Processed images are kept here until an editor converts them to the CDN, so this is
+  // served with every provider.
+  app.use(
+    "/dev-cdn",
+    (_req, res, next) => {
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+      next();
+    },
+    express.static(path.resolve(config.cdn.localDir), {
+      immutable: true,
+      maxAge: "30d",
+      index: false,
+      dotfiles: "deny",
+    }),
+  );
 
   if (config.serveClient) {
     const clientDir = path.resolve("dist");

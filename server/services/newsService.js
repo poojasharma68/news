@@ -12,8 +12,10 @@ import {
   ACTIVE_STATUSES,
   APPROVABLE_STATUSES,
   computeMissingFields,
+  CARD_VARIANT_KEYS,
   EXPORTABLE_STATUSES,
   FIELD_LABELS,
+  focusFor,
   MAX_BLOCKED_ATTEMPTS,
   mergeFocus,
   RETRYABLE_STATUSES,
@@ -21,14 +23,16 @@ import {
   STATUS_LABELS,
 } from "../../shared/types.js";
 import { checkArticleUrl, normalizeUrlKey } from "../../shared/urlUtils.js";
-import { HttpError } from "../lib/errors.js";
+import { HttpError, toPipelineError } from "../lib/errors.js";
 import { assertUrlAllowed } from "../lib/ssrf.js";
 import { recordEvent } from "./events.js";
 import {
+  convertToCdnFields,
   imageFields,
-  processAndUploadLogo,
-  processAndUploadVariants,
-  uploadOriginal,
+  localImageUrls,
+  processVariants,
+  storeLogo,
+  storeOriginal,
 } from "./pipeline.js";
 
 /** Failures that will not succeed on retry, so bulk retry skips them. */
@@ -65,7 +69,7 @@ function toPublicNews(row) {
 }
 
 /** Why a card cannot be approved yet, and what the editor should do next (null = approvable). */
-function approvalBlocker(card) {
+function approvalBlocker(card, onlyLocal = false) {
   if (ACTIVE_STATUSES.includes(card.status))
     return {
       next_action: "wait",
@@ -98,7 +102,19 @@ function approvalBlocker(card) {
       next_action: "complete_fields",
       reason: `Missing: ${missing.map((f) => FIELD_LABELS[f]).join(", ")}.`,
     };
+  if (onlyLocal)
+    return {
+      next_action: "convert_to_cdn",
+      reason: "The images are only stored locally. Open the card and click Convert to CDN first.",
+    };
   return null;
+}
+
+/** An HTTP error for a pipeline failure during a request (e.g. a CDN upload). */
+function asHttpError(err) {
+  if (err instanceof HttpError) return err;
+  const error = toPipelineError(err);
+  return new HttpError(error.code === "CDN_NOT_CONFIGURED" ? 400 : 502, error.message);
 }
 
 function cleanInputText(value) {
@@ -680,16 +696,57 @@ export class NewsService {
     return updated;
   }
 
-  /** Replaces the featured image with an uploaded file and regenerates all three variants. */
+  /**
+   * Crops all three variants for `changes` (as image_focus in updateCard) without uploading them,
+   * so the editor can review the result before "Convert to CDN" saves the crops and uploads.
+   */
+  async previewCrop(id, changes) {
+    const card = await this.requireCard(id);
+    this.assertNotProcessing(card);
+    if (!card.original_image_url)
+      throw new HttpError(
+        400,
+        "This card has no original image to re-crop. Upload the image again first.",
+      );
+    const focus = changes === null ? null : mergeFocus(card.image_focus ?? null, changes);
+    // The local test CDN reads its own files from disk; real URLs are downloaded.
+    const buffer =
+      (await this.deps.cdn.read?.(card.original_image_url)) ??
+      (await this.deps.images.download(card.original_image_url)).buffer;
+    const specs = this.deps.images.variantSpecs();
+    const variants = {};
+    for (const key of CARD_VARIANT_KEYS) {
+      const output = await this.deps.images.process(
+        buffer,
+        undefined,
+        specs[key],
+        focusFor(focus, key),
+      );
+      variants[key] = {
+        url: `data:${output.contentType};base64,${output.buffer.toString("base64")}`,
+        width: output.width,
+        height: output.height,
+        ...(output.content && { content: output.content }),
+        ...(output.auto && { auto: output.auto }),
+        ...(output.edgeFill && { edgeFill: output.edgeFill }),
+      };
+    }
+    return { image_focus: focus, variants };
+  }
+
+  /**
+   * Replaces the featured image with an uploaded file and regenerates all three variants; they
+   * are stored locally until Convert to CDN.
+   */
   async uploadThumbnail(id, buffer, user = null) {
     const card = await this.requireCard(id);
     this.assertNotProcessing(card);
     const info = await this.deps.images.inspect(buffer);
-    const result = await processAndUploadVariants(this.deps, buffer, undefined);
+    const result = await processVariants(this.deps, buffer, undefined);
     const patch = {
       ...imageFields(result, `upload:${info.sha256}`),
-      // Kept on the CDN so the focal point can be changed later without a new upload.
-      original_image_url: await uploadOriginal(this.deps, buffer, info.format),
+      // Kept so the focal point can be changed later without a new upload.
+      original_image_url: await storeOriginal(this.deps, buffer, info.format),
       image_focus: null,
       error_code: null,
       error_message: null,
@@ -710,11 +767,11 @@ export class NewsService {
     return updated;
   }
 
-  /** Stores an uploaded publisher logo on the CDN. It is kept separate from the featured image. */
+  /** Stores an uploaded publisher logo (locally until Convert to CDN), apart from the featured image. */
   async uploadLogo(id, buffer, user = null) {
     const card = await this.requireCard(id);
     this.assertNotProcessing(card);
-    const cdnUrl = await processAndUploadLogo(this.deps, buffer, undefined);
+    const cdnUrl = await storeLogo(this.deps, buffer, undefined);
     // An uploaded logo has no source URL; the CDN copy is the logo.
     const updated = await this.repo.updateCard(id, {
       publisher_logo_url: null,
@@ -723,6 +780,111 @@ export class NewsService {
     if (!updated) throw new HttpError(404, "News card not found.");
     await this.event(id, "logo_uploaded", { actor: user });
     return updated;
+  }
+
+  /**
+   * Puts the publisher logo on the current CDN: a logo not uploaded yet, or one still stored on
+   * the local test CDN from before the provider was switched. A logo already on the CDN is kept.
+   */
+  async convertLogoToCdn(id, user = null) {
+    const card = await this.requireCard(id);
+    this.assertNotProcessing(card);
+    const current = card.cdn_publisher_logo_url;
+    if (current && !this.deps.cdn.isForeignUrl?.(current)) return card;
+    let buffer = current ? await this.deps.cdn.read?.(current) : null;
+    if (!buffer && card.publisher_logo_url)
+      buffer = await this.deps.images.downloadLogo(card.publisher_logo_url);
+    if (!buffer)
+      throw new HttpError(
+        400,
+        "This card has no publisher logo to convert. Add a logo URL or upload a logo first.",
+      );
+    const stored = await storeLogo(this.deps, buffer, card.publisher_logo_url ?? undefined);
+    const { cdn_publisher_logo_url: cdnUrl = stored } = await convertToCdnFields(this.deps, {
+      ...card,
+      image_variants: {},
+      cdn_image_url: null,
+      original_image_url: null,
+      cdn_publisher_logo_url: stored,
+    });
+    const updated = await this.repo.updateCard(id, { cdn_publisher_logo_url: cdnUrl });
+    if (!updated) throw new HttpError(404, "News card not found.");
+    await this.event(id, "logo_converted", { actor: user });
+    return updated;
+  }
+
+  /**
+   * "Convert to CDN": saves the crops the editor applied (`imageFocus`, as image_focus in
+   * updateCard; undefined keeps the current ones), then uploads everything still stored locally
+   * (the three images, an uploaded original and the publisher logo) and switches the card to the
+   * CDN URLs. A logo that cannot be uploaded does not stop the images; it is reported as
+   * `logo_error`.
+   */
+  async convertToCdn(id, imageFocus, user = null) {
+    const card = await this.requireCard(id);
+    this.assertNotProcessing(card);
+    if (!this.deps.cdn.configured)
+      throw new HttpError(400, "The CDN is not configured (set CDN_PROVIDER and CDN_* variables).");
+
+    const patch = {};
+    let recropped = false;
+    let logoError = null;
+    try {
+      if (imageFocus !== undefined) {
+        const current = card.image_focus ?? null;
+        const focus = imageFocus === null ? null : mergeFocus(current, imageFocus);
+        if (!sameFocus(focus, current) || !card.cdn_image_url) {
+          if (!card.original_image_url)
+            throw new HttpError(
+              400,
+              "This card has no original image to re-crop. Upload the image again first.",
+            );
+          const buffer =
+            (await this.deps.cdn.read?.(card.original_image_url)) ??
+            (await this.deps.images.download(card.original_image_url)).buffer;
+          const result = await processVariants(
+            this.deps,
+            buffer,
+            card.original_image_url,
+            undefined,
+            focus,
+          );
+          Object.assign(patch, imageFields(result, card.cdn_image_source), { image_focus: focus });
+          recropped = true;
+        }
+      }
+      // A logo found on the article but never stored (e.g. its download failed) is tried again.
+      if (!card.cdn_publisher_logo_url && card.publisher_logo_url) {
+        try {
+          const buffer = await this.deps.images.downloadLogo(card.publisher_logo_url);
+          patch.cdn_publisher_logo_url = await storeLogo(this.deps, buffer, card.publisher_logo_url);
+        } catch (err) {
+          logoError = toPipelineError(err).message;
+        }
+      }
+      Object.assign(patch, await convertToCdnFields(this.deps, { ...card, ...patch }));
+      if (!Object.keys(patch).length) return { card, logo_error: logoError };
+
+      const after = { ...card, ...patch };
+      const updated = await this.repo.updateCard(id, {
+        ...patch,
+        // New crops need approval again; uploading the same images does not.
+        ...(recropped
+          ? this.statusAfterManualChange(card, after)
+          : { missing_fields: computeMissingFields(after) }),
+      });
+      if (!updated) throw new HttpError(404, "News card not found.");
+      await this.event(id, "converted_to_cdn", {
+        status: updated.status,
+        actor: user,
+        message: recropped
+          ? "New crops saved; images and logo uploaded to the CDN."
+          : "Images and logo uploaded to the CDN.",
+      });
+      return { card: updated, logo_error: logoError };
+    } catch (err) {
+      throw asHttpError(err);
+    }
   }
 
   // ── Review, publishing and export ──────────────────────────────────────────
@@ -739,7 +901,7 @@ export class NewsService {
         rejected.push({ id, reason: "Card not found.", next_action: "none" });
         continue;
       }
-      const blocker = approvalBlocker(card);
+      const blocker = approvalBlocker(card, localImageUrls(this.deps, card).length > 0);
       if (blocker) {
         rejected.push({ id, ...blocker });
         continue;
@@ -777,6 +939,11 @@ export class NewsService {
         });
       else if (computeMissingFields(card).length)
         rejected.push({ id, reason: "The card is incomplete." });
+      else if (localImageUrls(this.deps, card).length)
+        rejected.push({
+          id,
+          reason: "The images are only stored locally. Click Convert to CDN in the editor first.",
+        });
       else {
         const updated = await this.repo.updateCard(id, {
           status: "published",

@@ -2,6 +2,9 @@
  * End-to-end workflow: one article → one master record → three card outputs, CAPTCHA handling,
  * bulk approval/retry, partial CDN failures, edits, logos, restart recovery and the event log.
  */
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 import { PipelineError } from "../server/lib/errors.js";
@@ -173,6 +176,71 @@ describe("one article, three card outputs", () => {
     expect(replaced.image_focus).toBeNull();
   });
 
+  it("previews crops without uploading until they are converted to the CDN", async () => {
+    const ctx = await setup();
+    const card = await processOne(ctx);
+    const uploads = ctx.upload.mock.calls.length;
+
+    const preview = await ctx.service.previewCrop(card.id, { medium: { x: 0.2, y: 0.4 } });
+    expect(preview.image_focus).toEqual({ medium: { x: 0.2, y: 0.4 } });
+    for (const key of ["large", "medium", "small"])
+      expect(preview.variants[key].url).toMatch(/^data:image\//);
+    expect(ctx.upload.mock.calls.length).toBe(uploads);
+    const unchanged = await ctx.repo.getCard(card.id);
+    expect(unchanged.image_focus ?? null).toBeNull();
+    expect(unchanged.image_variants).toEqual(card.image_variants);
+
+    // Converting saves the previewed crops; only the changed card is uploaded.
+    await ctx.service.updateCard(card.id, { image_focus: preview.image_focus });
+    await ctx.queue.onIdle();
+    const done = await ctx.repo.getCard(card.id);
+    expect(done.image_focus).toEqual({ medium: { x: 0.2, y: 0.4 } });
+    expect(done.image_variants.medium.url).not.toBe(card.image_variants.medium.url);
+    expect(ctx.upload.mock.calls.length).toBe(uploads + 1);
+  });
+
+  it("keeps images and logo local until Convert to CDN, then switches to the CDN links", async () => {
+    const localDir = await mkdtemp(path.join(os.tmpdir(), "local-images-"));
+    try {
+      const meta = extraction().metadata;
+      const ctx = await setup({
+        localDir,
+        extract: async () =>
+          extraction({ metadata: { ...meta, publisherLogoUrl: "https://example.com/logo.png" } }),
+      });
+      const card = await processOne(ctx);
+      expect(ctx.upload).not.toHaveBeenCalled();
+      for (const key of ["large", "medium", "small"])
+        expect(card.image_variants[key].url).toMatch(/^http:\/\/localhost:8787\/dev-cdn\//);
+      expect(card.cdn_publisher_logo_url).toMatch(/\/dev-cdn\/news-card-logo-/);
+
+      // Not approvable while the images are only local.
+      const approval = await ctx.service.approve([card.id], "editor");
+      expect(approval.rejected[0]).toMatchObject({ next_action: "convert_to_cdn" });
+
+      // Convert saves the applied crop (re-cropped locally) and uploads everything.
+      const { card: converted, logo_error } = await ctx.service.convertToCdn(
+        card.id,
+        { medium: { x: 0.1, y: 0.1, w: 0.5, h: 0.5, fit: "crop" } },
+        "editor",
+      );
+      expect(logo_error).toBeNull();
+      expect(converted.image_focus).toEqual({ medium: { x: 0.1, y: 0.1, w: 0.5, h: 0.5, fit: "crop" } });
+      for (const key of ["large", "medium", "small"])
+        expect(converted.image_variants[key].url).toMatch(/^https:\/\/cdn\.example\.com\//);
+      expect(converted.cdn_image_url).toBe(converted.image_variants.large.url);
+      expect(converted.cdn_publisher_logo_url).toMatch(/^https:\/\/cdn\.example\.com\/news-card-logo-/);
+      expect(ctx.upload).toHaveBeenCalledTimes(4);
+      expect((await ctx.service.approve([card.id], "editor")).approved).toHaveLength(1);
+
+      // Everything is on the CDN: converting again uploads nothing.
+      await ctx.service.convertToCdn(card.id, undefined, "editor");
+      expect(ctx.upload).toHaveBeenCalledTimes(4);
+    } finally {
+      await rm(localDir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps an uploaded original so it can be re-cropped later", async () => {
     const ctx = await setup();
     const card = await processOne(ctx);
@@ -242,6 +310,34 @@ describe("publisher logos", () => {
     );
     const { article } = await ctx.service.getOutputs(card.id);
     expect(article.publisher_logo_url).toBe(updated.cdn_publisher_logo_url);
+  });
+
+  it("moves a logo left on the local test CDN to the current CDN, ignoring the stale cache", async () => {
+    const ctx = await setup();
+    const card = await processOne(ctx);
+    const logo = await sharp({
+      create: { width: 240, height: 80, channels: 4, background: "#123456" },
+    })
+      .png()
+      .toBuffer();
+    // The logo was uploaded while CDN_PROVIDER=local-dev, then the provider was switched.
+    const localUrl = "http://localhost:8787/dev-cdn/news-card-logo-old.webp";
+    const uploaded = await ctx.service.uploadLogo(card.id, logo, "editor");
+    for (const record of ctx.repo.images.values())
+      if (record.cdn_url === uploaded.cdn_publisher_logo_url) record.cdn_url = localUrl;
+    await ctx.repo.updateCard(card.id, { cdn_publisher_logo_url: localUrl });
+    const cdn = ctx.service.deps.cdn;
+    cdn.read = async (url) => (url === localUrl ? logo : null);
+    cdn.isForeignUrl = (url) => url.includes("/dev-cdn/");
+    const uploads = ctx.upload.mock.calls.length;
+
+    const updated = await ctx.service.convertLogoToCdn(card.id, "editor");
+    expect(updated.cdn_publisher_logo_url).toBe(uploaded.cdn_publisher_logo_url);
+    expect(ctx.upload.mock.calls.length).toBe(uploads + 1);
+
+    // Already on the CDN: nothing is uploaded again.
+    await ctx.service.convertLogoToCdn(card.id, "editor");
+    expect(ctx.upload.mock.calls.length).toBe(uploads + 1);
   });
 });
 

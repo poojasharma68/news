@@ -6,14 +6,24 @@ import {
   CARD_VARIANTS,
   computeMissingFields,
   FIELD_LABELS,
+  focusFor,
   MAX_BLOCKED_ATTEMPTS,
   RETRYABLE_STATUSES,
+  sameFocus,
   STAGE_LABELS,
 } from "../../../shared/types.js";
 import { api } from "../../lib/api";
 import { useAppConfig } from "../../lib/config";
 import { navigate, useInterval } from "../../lib/hooks";
-import { ActivityLog } from "../ActivityLog/ActivityLog";
+import { cardNeedsCdn } from "../../lib/localImages";
+import {
+  buildBookmarklet,
+  IMPORT_MESSAGE_TYPE,
+  pageImportImage,
+  pageImportLogo,
+  parsePageImport,
+  sameSite,
+} from "../../lib/pageImport";
 import { CardOutputs } from "../CardOutputs/CardOutputs";
 import { FocusPicker } from "../FocusPicker/FocusPicker";
 import { StatusBadge } from "../StatusBadge";
@@ -45,13 +55,22 @@ function diff(form, base) {
   return update;
 }
 
-const METHOD_LABELS = {
-  metadata: "Page metadata",
-  browser: "Browser rendering",
-  api: "Publisher API",
-  rss: "RSS feed",
-  manual: "Manual entry",
+const IMPORT_LABELS = {
+  title: "title",
+  description: "description",
+  publisher: "publisher",
+  published_at: "date",
+  original_image_url: "image",
+  publisher_logo_url: "logo",
+  article_url: "article URL",
 };
+
+const bookmarklet = buildBookmarklet(window.location.origin);
+// React warns about javascript: URLs in JSX, so the bookmark's href is set directly.
+const setBookmarkletHref = (el) => el?.setAttribute("href", bookmarklet);
+// Versioned: a bookmark saved before v2 does not send the publisher logo and must be re-added.
+const BOOKMARK_VERSION = 2;
+const BOOKMARK_READY_KEY = `mu-news-bookmark-ready-v${BOOKMARK_VERSION}`;
 
 export function NewsCardEditor({ cardId }) {
   const config = useAppConfig();
@@ -61,6 +80,12 @@ export function NewsCardEditor({ cardId }) {
   const [form, setForm] = useState(null);
   const [loadError, setLoadError] = useState(null);
   const [busy, setBusy] = useState(null);
+  // Applied crops shown in the outputs but not on the CDN yet: { image_focus, variants }.
+  const [cropPreview, setCropPreview] = useState(null);
+  // Set once the bookmark has delivered page details, so the setup step can stay collapsed.
+  const [bookmarkReady, setBookmarkReady] = useState(
+    () => localStorage.getItem(BOOKMARK_READY_KEY) === "1",
+  );
   const fileInput = useRef(null);
   const logoInput = useRef(null);
 
@@ -97,20 +122,24 @@ export function NewsCardEditor({ cardId }) {
     void load(true);
   }, [load]);
 
+  // A preview belongs to one original image.
+  useEffect(() => setCropPreview(null), [cardId, card?.original_image_url]);
+
   const processing = !!card && ACTIVE_STATUSES.includes(card.status);
   // While processing, keep refreshing; the form is reset only if the user has not edited it.
   useInterval(() => void load(!dirty), 2000, processing);
 
-  // Warn before leaving with unsaved edits.
+  // Warn before leaving with unsaved edits or crops not converted to the CDN.
+  const unsaved = dirty || !!cropPreview;
   useEffect(() => {
-    if (!dirty) return;
+    if (!unsaved) return;
     const handler = (e) => {
       e.preventDefault();
       e.returnValue = "";
     };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
-  }, [dirty]);
+  }, [unsaved]);
 
   const run = async (key, action) => {
     setBusy(key);
@@ -195,25 +224,215 @@ export function NewsCardEditor({ cardId }) {
     });
   };
 
+  // Key of the last page details applied, so the same details are not imported twice.
+  const lastImport = useRef(null);
+  const importKey = (message) =>
+    `${message?.page}|${JSON.stringify(message?.data ?? null)}`;
+
+  /** Fills the empty form fields with details sent from the article page. */
+  const applyImport = useCallback(
+    (message) => {
+      if (!card || !form) return;
+      let fields;
+      try {
+        fields = parsePageImport(message, card.source_url);
+      } catch (err) {
+        toast.error(err.message);
+        return;
+      }
+      lastImport.current = importKey(message);
+      const outdated = !(message.v >= BOOKMARK_VERSION);
+      if (outdated) {
+        localStorage.removeItem(BOOKMARK_READY_KEY);
+        setBookmarkReady(false);
+        toast.info(
+          "Your bookmark is out of date and cannot send the logo. Drag the new “Send to News Card Studio” button to your bookmarks bar, replacing the old one.",
+        );
+      } else {
+        localStorage.setItem(BOOKMARK_READY_KEY, "1");
+        setBookmarkReady(true);
+      }
+      const image = pageImportImage(message);
+      // An existing logo is kept, like every other field that is already filled in.
+      const hasLogo =
+        !!card.cdn_publisher_logo_url || !!form.publisher_logo_url.trim();
+      const logo = hasLogo ? null : pageImportLogo(message);
+      // A file downloaded in the editor's browser replaces its address. When the browser could
+      // not download it (the CDN refuses cross-site requests), the address is kept and the
+      // server downloads it on save: image CDNs are rarely behind the publisher's CAPTCHA.
+      const values = {
+        ...fields,
+        published_at: toDateInputValue(fields.published_at, tz),
+        original_image_url: image ? "" : fields.original_image_url,
+        publisher_logo_url: logo || hasLogo ? "" : fields.publisher_logo_url,
+      };
+      const updates = Object.fromEntries(
+        Object.entries(values).filter(
+          ([key, value]) => value && !form[key].trim(),
+        ),
+      );
+      const filled = Object.keys(updates).map((key) => IMPORT_LABELS[key]);
+      setForm((f) => (f ? { ...f, ...updates } : f));
+      if (image || logo)
+        void run("upload", async () => {
+          // One after the other, so each upload starts from the card the previous one returned.
+          if (image) {
+            try {
+              const updated = await api.uploadThumbnail(card.id, image);
+              setCard(updated);
+              setForm((f) =>
+                f ? { ...f, original_image_url: updated.original_image_url ?? "" } : f,
+              );
+              toast.success("Article image uploaded; all three sizes are ready locally.");
+            } catch (err) {
+              setForm((f) =>
+                f && !f.original_image_url.trim()
+                  ? { ...f, original_image_url: fields.original_image_url }
+                  : f,
+              );
+              toast.error(`The article image could not be uploaded: ${err.message}`);
+            }
+          }
+          if (logo) {
+            try {
+              const updated = await api.uploadLogo(card.id, logo);
+              setCard(updated);
+              setForm((f) => (f ? { ...f, publisher_logo_url: "" } : f));
+              toast.success("Publisher logo uploaded; it is stored locally until Convert to CDN.");
+            } catch (err) {
+              // Fall back to the address, which the server tries again on save.
+              setForm((f) =>
+                f && !f.publisher_logo_url.trim()
+                  ? { ...f, publisher_logo_url: fields.publisher_logo_url }
+                  : f,
+              );
+              toast.error(`The publisher logo could not be uploaded: ${err.message}`);
+            }
+          }
+        });
+      if (filled.length)
+        toast.success(
+          `Filled in from the article: ${filled.join(", ")}. Check them, then click Save draft.`,
+        );
+      else if (!image && !logo)
+        toast.info("The page details were received; every field was already filled in.");
+    },
+    [card, form, tz, toast],
+  );
+
+  // Details sent by the bookmark from the article tab opened with "Open article to verify".
+  useEffect(() => {
+    if (card?.status !== "verification_required") return;
+    const onMessage = (e) => {
+      if (e.data?.type !== IMPORT_MESSAGE_TYPE) return;
+      if (!sameSite(e.origin, card.source_url)) return;
+      applyImport(e.data);
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [card?.status, card?.source_url, applyImport]);
+
+  // When Cloudflare cuts the link between the tabs, the bookmark copies the details instead.
+  // Once clipboard access is allowed (first "Paste page details"), they are read on return.
+  useEffect(() => {
+    if (card?.status !== "verification_required") return;
+    const onFocus = async () => {
+      try {
+        const permission = await navigator.permissions.query({
+          name: "clipboard-read",
+        });
+        if (permission.state !== "granted") return;
+        const text = await navigator.clipboard.readText();
+        if (!text) return;
+        const message = JSON.parse(text);
+        if (message?.type !== IMPORT_MESSAGE_TYPE) return;
+        if (!sameSite(message.page, card.source_url)) return;
+        if (importKey(message) === lastImport.current) return;
+        applyImport(message);
+      } catch {
+        // Clipboard unavailable or not page details: nothing to do.
+      }
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [card?.status, card?.source_url, applyImport]);
+
+  // The article tab must keep `window.opener` so the bookmark can send its details back.
+  const openForVerification = () => window.open(card.source_url, "_blank");
+
+  const pasteImport = async () => {
+    let text = null;
+    try {
+      text = await navigator.clipboard.readText();
+    } catch {
+      text = window.prompt("Paste the page details copied by the bookmark:");
+    }
+    if (!text) return;
+    try {
+      applyImport(JSON.parse(text));
+    } catch {
+      toast.error(
+        "The clipboard does not contain page details. Click the bookmark on the article page first.",
+      );
+    }
+  };
+
   const uploadLogo = (file) => {
     if (!card || !file) return;
     void run("logo", async () => {
       const updated = await api.uploadLogo(card.id, file);
       setCard(updated);
       setForm((f) => (f ? { ...f, publisher_logo_url: "" } : f));
-      toast.success("Publisher logo uploaded to the CDN.");
+      toast.success("Publisher logo uploaded; it is stored locally until Convert to CDN.");
     }).finally(() => {
       if (logoInput.current) logoInput.current.value = "";
     });
   };
 
-  /** `changes` maps a variant to its new focus point, or to null for the automatic crop. */
+  /**
+   * `changes` maps a variant to its new focus point, or to null for the automatic crop. The three
+   * images are cropped for the outputs below; nothing is uploaded until Convert to CDN.
+   */
   const applyFocus = (changes) => {
     if (!card) return;
     void run("focus", async () => {
-      const updated = await api.updateCard(card.id, { image_focus: changes });
-      applyCard(updated, true);
-      toast.success("Crop saved. Re-creating the changed images…");
+      const base = cropPreview ? cropPreview.image_focus : (card.image_focus ?? null);
+      const merged = Object.fromEntries(
+        CARD_VARIANTS.map(({ key }) => [key, key in changes ? changes[key] : focusFor(base, key)]),
+      );
+      const preview = await api.previewCrop(card.id, merged);
+      if (sameFocus(preview.image_focus, card.image_focus ?? null)) {
+        setCropPreview(null);
+        toast.success("These are the crops the card already has.");
+        return;
+      }
+      setCropPreview(preview);
+      toast.success("Crop applied to the outputs below. Click Convert to CDN to upload them.");
+    });
+  };
+
+  /**
+   * Saves the applied crops (if any) and uploads everything still stored locally (the three
+   * images and the publisher logo) to the CDN; the outputs then show the CDN links.
+   */
+  const convertToCdn = () => {
+    if (!card) return;
+    if (!cropPreview && !cardNeedsCdn(card, config.cdn_provider)) return;
+    void run("cdn", async () => {
+      const focus = cropPreview?.image_focus;
+      const result = await api.convertToCdn(
+        card.id,
+        !cropPreview
+          ? undefined
+          : focus
+            ? Object.fromEntries(CARD_VARIANTS.map(({ key }) => [key, focusFor(focus, key)]))
+            : null,
+      );
+      setCropPreview(null);
+      applyCard(result.card, true);
+      if (result.logo_error)
+        toast.error(`Images are on the CDN, but the publisher logo could not be uploaded: ${result.logo_error}`);
+      else toast.success("Images and logo are on the CDN.");
     });
   };
 
@@ -225,11 +444,27 @@ export function NewsCardEditor({ cardId }) {
       setForm((f) =>
         f ? { ...f, original_image_url: updated.original_image_url ?? "" } : f,
       );
-      toast.success("Thumbnail uploaded; all three sizes are on the CDN.");
+      toast.success("Thumbnail uploaded; all three sizes are ready locally. Convert to CDN uploads them.");
     }).finally(() => {
       if (fileInput.current) fileInput.current.value = "";
     });
   };
+
+  // Last resort when neither the browser nor the server can download the article image: the
+  // editor copies it on the article (right-click → Copy image) and pastes it here.
+  useEffect(() => {
+    if (!card || ACTIVE_STATUSES.includes(card.status)) return;
+    const onPaste = (e) => {
+      const file = [...(e.clipboardData?.files ?? [])].find((f) =>
+        f.type.startsWith("image/"),
+      );
+      if (!file) return;
+      e.preventDefault();
+      uploadFile(file);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  });
 
   if (loadError && !card) {
     return (
@@ -251,6 +486,8 @@ export function NewsCardEditor({ cardId }) {
     form.original_image_url !== (card.original_image_url ?? "");
   const logoPending =
     form.publisher_logo_url !== (card.publisher_logo_url ?? "");
+  // Anything still stored only on this server; Convert to CDN uploads it.
+  const needsCdn = !imagePending && !logoPending && cardNeedsCdn(card, config.cdn_provider);
   const previewCard = {
     title: form.title,
     description: form.description,
@@ -260,13 +497,19 @@ export function NewsCardEditor({ cardId }) {
       : null,
     canonical_url: form.article_url,
     source_url: card.source_url,
-    cdn_image_url: imagePending ? null : card.cdn_image_url,
-    image_variants: imagePending ? {} : card.image_variants,
+    cdn_image_url: imagePending
+      ? null
+      : (cropPreview?.variants.large?.url ?? card.cdn_image_url),
+    image_variants: imagePending ? {} : (cropPreview?.variants ?? card.image_variants),
     cdn_publisher_logo_url: logoPending ? null : card.cdn_publisher_logo_url,
   };
   const missing = computeMissingFields({ ...previewCard });
   const canApprove =
-    APPROVABLE_STATUSES.includes(card.status) && missing.length === 0 && !dirty;
+    APPROVABLE_STATUSES.includes(card.status) &&
+    missing.length === 0 &&
+    !dirty &&
+    !cropPreview &&
+    !needsCdn;
   const locked = processing || busy !== null;
   const aspect = `${config.image.width} / ${config.image.height}`;
   const retryCapped =
@@ -301,14 +544,21 @@ export function NewsCardEditor({ cardId }) {
                 )}
               </p>
             </div>
-            <a
-              className="btn btnSmall"
-              href={card.source_url}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Open article ↗
-            </a>
+            <div className="actionsRow">
+              <a className="btn btnSmall" href={`#/cards/${card.id}/details`}>
+                Details &amp; history
+              </a>
+              {card.status !== "verification_required" && (
+                <a
+                  className="btn btnSmall"
+                  href={card.source_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Open article ↗
+                </a>
+              )}
+            </div>
           </div>
 
           {card.status === "verification_required" && (
@@ -316,23 +566,64 @@ export function NewsCardEditor({ cardId }) {
               <strong>Verification required.</strong>{" "}
               {card.verification_reason ??
                 "The publisher blocked automated access."}
-              <p>
-                Approving or retrying does not get past a CAPTCHA, and this tool
-                never tries to.
+              <details className="bookmarkSetup" open={!bookmarkReady}>
+                <summary>
+                  {bookmarkReady
+                    ? "Bookmark set up ✓ (show setup again)"
+                    : "First time only: add the bookmark (10 seconds)"}
+                </summary>
+                <p>
+                  Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> to show
+                  your bookmarks bar, then drag this button onto it:{" "}
+                  <a
+                    ref={setBookmarkletHref}
+                    className="btn btnSmall bookmarklet"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      toast.info(
+                        "Don't click it here. Drag it to your bookmarks bar.",
+                      );
+                    }}
+                  >
+                    Send to News Card Studio
+                  </a>
+                </p>
+              </details>
+              <div className="verifySteps">
+                <div>
+                  <strong>1.</strong>{" "}
+                  <button
+                    type="button"
+                    className="btn btnSmall btnPrimary"
+                    onClick={openForVerification}
+                  >
+                    Open article ↗
+                  </button>{" "}
+                  and solve the CAPTCHA.
+                </div>
+                <div>
+                  <strong>2.</strong> On the article, click the{" "}
+                  <strong>Send to News Card Studio</strong> bookmark. The form
+                  below fills in by itself.
+                </div>
+                <div>
+                  <strong>3.</strong> Click <strong>Save draft</strong>.
+                </div>
+              </div>
+              <p className="muted small">
+                Form didn't fill in?{" "}
+                <button
+                  type="button"
+                  className="linkButton"
+                  onClick={() => void pasteImport()}
+                  disabled={locked}
+                >
+                  Paste page details
+                </button>{" "}
+                or type the details yourself. Image missing? Right-click it on
+                the article, choose <strong>Copy image</strong>, then press{" "}
+                <kbd>Ctrl</kbd>+<kbd>V</kbd> here.
               </p>
-              <ol>
-                <li>
-                  Open the article in your browser (button above) and complete any
-                  check yourself.
-                </li>
-                <li>Copy the missing details into the fields below.</li>
-                <li>
-                  Paste the article's image address, or upload the image file.
-                </li>
-                <li>
-                  Save — processing resumes automatically for the thumbnail.
-                </li>
-              </ol>
             </div>
           )}
           {card.status === "duplicate" && card.duplicate_of && (
@@ -495,7 +786,7 @@ export function NewsCardEditor({ cardId }) {
               {card.cdn_image_url && !imagePending ? (
                 <img
                   src={card.cdn_image_url}
-                  alt="Current CDN thumbnail"
+                  alt="Current thumbnail"
                   style={{ aspectRatio: aspect }}
                 />
               ) : (
@@ -504,7 +795,7 @@ export function NewsCardEditor({ cardId }) {
                     ? "New image will be processed when you save"
                     : noPhotoReason
                       ? "No article photo found — see the reason below"
-                      : "No CDN image yet"}
+                      : "No image yet"}
                 </div>
               )}
               <div className="thumbMeta">
@@ -535,7 +826,7 @@ export function NewsCardEditor({ cardId }) {
                 )}
                 {!config.cdn_configured && (
                   <small className="inlineError">
-                    The CDN is not configured — thumbnails cannot be uploaded yet.
+                    The CDN is not configured — images are kept locally until it is.
                   </small>
                 )}
               </div>
@@ -544,8 +835,8 @@ export function NewsCardEditor({ cardId }) {
             {card.original_image_url && !imagePending && (
               <FocusPicker
                 imageUrl={card.original_image_url}
-                focus={card.image_focus}
-                variants={card.image_variants}
+                focus={cropPreview ? cropPreview.image_focus : card.image_focus}
+                variants={cropPreview?.variants ?? card.image_variants}
                 sizes={config.image.variants}
                 disabled={locked || dirty}
                 busy={busy === "focus"}
@@ -643,7 +934,9 @@ export function NewsCardEditor({ cardId }) {
                 title={
                   dirty
                     ? "Save your changes first"
-                    : missing.length
+                    : cropPreview || needsCdn
+                      ? "Click Convert to CDN first; the images are only stored locally"
+                      : missing.length
                       ? `Missing: ${missing.map((f) => FIELD_LABELS[f]).join(", ")}`
                       : undefined
                 }
@@ -656,8 +949,12 @@ export function NewsCardEditor({ cardId }) {
                 type="button"
                 className="btn btnPrimary"
                 onClick={publish}
-                disabled={locked || dirty}
-                title="Shows this approved version on the website"
+                disabled={locked || dirty || !!cropPreview || needsCdn}
+                title={
+                  needsCdn
+                    ? "Click Convert to CDN first; the images are only stored locally"
+                    : "Shows this approved version on the website"
+                }
               >
                 {busy === "publish" ? "Saving…" : "Save final changes"}
               </button>
@@ -716,65 +1013,6 @@ export function NewsCardEditor({ cardId }) {
             )}
         </form>
 
-        <aside className="editorSide">
-          <section className="panel">
-            <h2>Details</h2>
-            <dl className="detailList">
-              <dt>Extraction</dt>
-              <dd>
-                {card.extraction_method
-                  ? METHOD_LABELS[card.extraction_method]
-                  : "—"}
-              </dd>
-              <dt>Missing</dt>
-              <dd>
-                {card.missing_fields.length
-                  ? card.missing_fields.map((f) => FIELD_LABELS[f]).join(", ")
-                  : "Nothing"}
-              </dd>
-              <dt>Original image</dt>
-              <dd className="truncate mono">{card.original_image_url ?? "—"}</dd>
-              <dt>Attempts</dt>
-              <dd>{card.attempts}</dd>
-              <dt>Created</dt>
-              <dd>{new Date(card.created_at).toLocaleString()}</dd>
-              <dt>Updated</dt>
-              <dd>{new Date(card.updated_at).toLocaleString()}</dd>
-              {card.approved_at && (
-                <>
-                  <dt>Approved</dt>
-                  <dd>
-                    {new Date(card.approved_at).toLocaleString()}
-                    {card.approved_by && ` by ${card.approved_by}`}
-                  </dd>
-                </>
-              )}
-              <dt>Website</dt>
-              <dd>
-                {card.live_card && card.site_published_at
-                  ? `Live since ${new Date(card.site_published_at).toLocaleString()}${
-                      card.status === "published" ? "" : " (older version; save again to update)"
-                    }`
-                  : "Not on the website"}
-              </dd>
-              {card.live_card && (
-                <>
-                  <dt>Website API</dt>
-                  <dd className="truncate mono">
-                    <a href={`/api/public/news/${card.id}`} target="_blank" rel="noreferrer">
-                      /api/public/news/{card.id}
-                    </a>
-                  </dd>
-                </>
-              )}
-            </dl>
-          </section>
-
-          <section className="panel">
-            <h2>History</h2>
-            <ActivityLog cardId={card.id} version={card.updated_at} />
-          </section>
-        </aside>
       </div>
 
       <section className="panel" aria-labelledby="outputs-title">
@@ -787,6 +1025,35 @@ export function NewsCardEditor({ cardId }) {
               title and description are clamped to two lines.
             </p>
           </div>
+          {(card.original_image_url || needsCdn) && (
+            <div className="actionsRow">
+              {cropPreview && (
+                <button
+                  type="button"
+                  className="btn btnSmall"
+                  onClick={() => setCropPreview(null)}
+                  disabled={locked}
+                >
+                  Discard crops
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn btnSmall btnPrimary"
+                onClick={convertToCdn}
+                disabled={(!cropPreview && !needsCdn) || locked || !config.cdn_configured}
+                title={
+                  !config.cdn_configured
+                    ? "The CDN is not configured"
+                    : cropPreview || needsCdn
+                      ? "Uploads the three images and the publisher logo to the CDN"
+                      : "Everything shown is already on the CDN"
+                }
+              >
+                {busy === "cdn" ? "Converting…" : "Convert to CDN"}
+              </button>
+            </div>
+          )}
         </div>
         <CardOutputs card={previewCard} />
       </section>

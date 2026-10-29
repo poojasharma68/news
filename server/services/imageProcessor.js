@@ -5,7 +5,13 @@
  */
 import { createHash } from "node:crypto";
 import sharp from "sharp";
-import { CARD_VARIANTS, MAX_FOCUS_ZOOM, PRIMARY_VARIANT } from "../../shared/types.js";
+import {
+  CARD_VARIANTS,
+  HEX_COLOUR,
+  MAX_FOCUS_ZOOM,
+  PRIMARY_VARIANT,
+  isCropRegion,
+} from "../../shared/types.js";
 import { PipelineError } from "../lib/errors.js";
 
 /** Input formats accepted from publishers and uploads. SVG is deliberately excluded. */
@@ -36,9 +42,16 @@ export function specSignature(spec) {
   return `${spec.width}x${spec.height}:${spec.fit}:${spec.position}:${spec.format}:q${spec.quality}:${spec.background}`;
 }
 
-/** A valid crop ({ x, y } in 0–1, optional zoom 1–MAX_FOCUS_ZOOM), or null. */
+/**
+ * A valid crop ({ x, y } in 0–1, optional zoom 1–MAX_FOCUS_ZOOM), { fit: "contain" } for the
+ * whole image, { fit: "crop", x, y, w, h } for a free crop stretched over the card, or null.
+ */
 export function normalizeFocus(focus) {
   if (!focus) return null;
+  if (focus.fit === "crop")
+    return isCropRegion(focus) ? { x: focus.x, y: focus.y, w: focus.w, h: focus.h, fit: "crop" } : null;
+  if (focus.fit === "contain")
+    return { x: 0.5, y: 0.5, fit: "contain", ...(HEX_COLOUR.test(focus.fill ?? "") && { fill: focus.fill }) };
   const { x, y, zoom = 1 } = focus;
   const ok = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
   const zoomOk = typeof zoom === "number" && zoom >= 1 && zoom <= MAX_FOCUS_ZOOM;
@@ -63,6 +76,82 @@ export function focusCrop(sourceWidth, sourceHeight, width, height, focus) {
     left: Math.round((scaledWidth - width) * focus.x),
     top: Math.round((scaledHeight - height) * focus.y),
   };
+}
+
+/** Edge colours are measured on a small copy. */
+const EDGE_ANALYSIS_SIZE = 256;
+
+/**
+ * The most common colour of the listed RGBA pixels, as #rrggbb; null when most are transparent.
+ * Similar colours are grouped (16 levels per channel) and the largest group is averaged, so the
+ * result is always a colour the edge really has (a median per channel can mix one that is not).
+ */
+function dominantColour(data, pixels) {
+  const opaque = pixels.filter((i) => data[i + 3] >= 128);
+  // Transparent edges (a logo without a background): the card's background colour is used.
+  if (!opaque.length || opaque.length < pixels.length / 2) return null;
+  const groups = new Map();
+  for (const i of opaque) {
+    const key = ((data[i] >> 4) << 8) | ((data[i + 1] >> 4) << 4) | (data[i + 2] >> 4);
+    const group = groups.get(key) ?? { n: 0, r: 0, g: 0, b: 0 };
+    group.n += 1;
+    group.r += data[i];
+    group.g += data[i + 1];
+    group.b += data[i + 2];
+    groups.set(key, group);
+  }
+  let top = null;
+  for (const group of groups.values()) if (!top || group.n > top.n) top = group;
+  const hex = [top.r, top.g, top.b]
+    .map((sum) => Math.round(sum / top.n).toString(16).padStart(2, "0"))
+    .join("");
+  return `#${hex}`;
+}
+
+/**
+ * The colours of a photo's edges, as #rrggbb (null when transparent): `sides` (left and right
+ * columns) fills the space beside a whole image in a wider card, `ends` (top and bottom rows)
+ * the space above and below it in a taller one. A logo on black gets black, so the card looks
+ * seamless.
+ */
+export async function edgeColours(buffer, region = null) {
+  const { data, info } = await (await regionImage(buffer, region))
+    .resize({ width: EDGE_ANALYSIS_SIZE, height: EDGE_ANALYSIS_SIZE, fit: "inside", withoutEnlargement: true })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const { width: w, height: h } = info;
+  const at = (x, y) => (y * w + x) * 4;
+  const sides = [];
+  const ends = [];
+  for (let d = 0; d < Math.min(2, w, h); d++) {
+    for (let y = 0; y < h; y++) sides.push(at(d, y), at(w - 1 - d, y));
+    for (let x = 0; x < w; x++) ends.push(at(x, d), at(x, h - 1 - d));
+  }
+  return { sides: dominantColour(data, sides), ends: dominantColour(data, ends) };
+}
+
+/** The fill around a whole sourceWidth × sourceHeight image in a width × height card. */
+export function wholeImageFill(edges, sourceWidth, sourceHeight, width, height) {
+  const beside = sourceWidth / sourceHeight < width / height;
+  return (beside ? edges?.sides : edges?.ends) ?? null;
+}
+
+/** Fits the whole image inside width × height on a solid `fill` colour, centred. */
+async function containFrame(pipeline, width, height, fill) {
+  const { data, info } = await pipeline
+    .resize({ width, height, fit: "inside" })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  return sharp({ create: { width, height, channels: 4, background: fill } }).composite([
+    {
+      input: data,
+      raw: { width: info.width, height: info.height, channels: 4 },
+      left: Math.round((width - info.width) / 2),
+      top: Math.round((height - info.height) / 2),
+    },
+  ]);
 }
 
 /** Padding detection runs on a small greyscale copy; the ratios below do not depend on its size. */
@@ -401,6 +490,7 @@ export class ImageService {
     this.fetchOptions = fetchOptions;
     this.contentBoxes = new Map();
     this.profiles = new Map();
+    this.edges = new Map();
   }
 
   /** detectContentBox, remembered per source so the three variants analyse an image once. */
@@ -411,6 +501,10 @@ export class ImageService {
   }
 
   /** saliencyProfile of the photo inside its padding, remembered per source. */
+  async edgeColours(buffer, sourceHash, content) {
+    return remember(this.edges, sourceHash, () => edgeColours(buffer, content).catch(() => null));
+  }
+
   async profile(buffer, sourceHash, content) {
     return remember(this.profiles, sourceHash, () =>
       saliencyProfile(buffer, content).catch(() => null),
@@ -558,13 +652,17 @@ export class ImageService {
       let pipeline = source.rotate();
       let sourceWidth = orientedWidth;
       let sourceHeight = orientedHeight;
+      let contentLeft = 0;
+      let contentTop = 0;
       if (content) {
-        const left = Math.round(content.left * orientedWidth);
-        const top = Math.round(content.top * orientedHeight);
-        sourceWidth = Math.min(orientedWidth - left, Math.round(content.width * orientedWidth));
-        sourceHeight = Math.min(orientedHeight - top, Math.round(content.height * orientedHeight));
-        // extract() before resize() runs on the auto-rotated source.
-        pipeline = pipeline.extract({ left, top, width: sourceWidth, height: sourceHeight });
+        contentLeft = Math.round(content.left * orientedWidth);
+        contentTop = Math.round(content.top * orientedHeight);
+        sourceWidth = Math.min(orientedWidth - contentLeft, Math.round(content.width * orientedWidth));
+        sourceHeight = Math.min(orientedHeight - contentTop, Math.round(content.height * orientedHeight));
+        // extract() before resize() runs on the auto-rotated source. A free crop extracts its own
+        // rectangle of the photo instead (Sharp keeps only one extract before a resize).
+        if (focus?.fit !== "crop")
+          pipeline = pipeline.extract({ left: contentLeft, top: contentTop, width: sourceWidth, height: sourceHeight });
       }
       const upscaled = sourceWidth < width || sourceHeight < height;
 
@@ -575,7 +673,32 @@ export class ImageService {
       }
       const crop = focus ?? auto;
 
-      if (crop && sourceWidth && sourceHeight) {
+      // The colour around the whole image in this card, measured even while it is cropped, so
+      // the editor can preview "Fit whole image" exactly.
+      const edges =
+        spec.fit === "cover" && sourceWidth && sourceHeight
+          ? await this.edgeColours(buffer, sourceHash, content)
+          : null;
+      const edgeFill = edges
+        ? wholeImageFill(edges, sourceWidth, sourceHeight, width, height)
+        : null;
+
+      if (focus?.fit === "crop" && sourceWidth && sourceHeight) {
+        // The chosen rectangle fills the card's full width and height (stretched if its shape
+        // differs from the card's).
+        const left = Math.min(sourceWidth - 1, Math.round(focus.x * sourceWidth));
+        const top = Math.min(sourceHeight - 1, Math.round(focus.y * sourceHeight));
+        pipeline = pipeline
+          .extract({
+            left: contentLeft + left,
+            top: contentTop + top,
+            width: Math.max(1, Math.min(sourceWidth - left, Math.round(focus.w * sourceWidth))),
+            height: Math.max(1, Math.min(sourceHeight - top, Math.round(focus.h * sourceHeight))),
+          })
+          .resize({ width, height, fit: "fill" });
+      } else if (focus?.fit === "contain" && sourceWidth && sourceHeight) {
+        pipeline = await containFrame(pipeline, width, height, focus.fill ?? edgeFill ?? background);
+      } else if (crop && sourceWidth && sourceHeight) {
         const area = focusCrop(sourceWidth, sourceHeight, width, height, crop);
         // extract() after resize() runs on the resized image, in a single decode/encode.
         pipeline = pipeline
@@ -610,11 +733,12 @@ export class ImageService {
         contentType: CONTENT_TYPES[format],
         width: info.width,
         height: info.height,
-        cacheKey: `${sourceHash}:${specSignature(spec)}${content ? `:content${content.left},${content.top},${content.width},${content.height}` : ""}${focus ? `:focus${focus.x.toFixed(3)},${focus.y.toFixed(3)}${focus.zoom ? `,z${focus.zoom.toFixed(3)}` : ""}` : ""}${auto ? `:auto${auto.x.toFixed(3)},${auto.y.toFixed(3)}` : ""}`,
+        cacheKey: `${sourceHash}:${specSignature(spec)}${content ? `:content${content.left},${content.top},${content.width},${content.height}` : ""}${focus?.fit === "contain" ? `:contain${focus.fill ?? ""}` : focus?.fit === "crop" ? `:crop${[focus.x, focus.y, focus.w, focus.h].map((v) => v.toFixed(4)).join(",")}` : focus ? `:focus${focus.x.toFixed(3)},${focus.y.toFixed(3)}${focus.zoom ? `,z${focus.zoom.toFixed(3)}` : ""}` : ""}${auto ? `:auto${auto.x.toFixed(3)},${auto.y.toFixed(3)}` : ""}`,
         sourceHash,
         upscaled,
         content,
         auto,
+        edgeFill,
       };
     } catch (err) {
       if (err instanceof PipelineError) throw err;

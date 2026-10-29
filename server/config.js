@@ -124,9 +124,11 @@ const envSchema = z.object({
 
   CDN_PROVIDER: z.preprocess(
     emptyToUndefined,
-    z.enum(["http", "local-dev", "none"]).default("none"),
+    z.enum(["http", "unionstack", "local-dev", "none"]).default("none"),
   ),
   CDN_UPLOAD_URL: optionalString,
+  UNIONSTACK_API_KEY: optionalString,
+  UNIONSTACK_API_DOMAIN: optionalString,
   CDN_HTTP_METHOD: z.preprocess(
     emptyToUndefined,
     z.enum(["POST", "PUT"]).default("POST"),
@@ -206,6 +208,9 @@ export function loadConfig(source = process.env) {
   }
   if (env.CDN_PROVIDER === "http" && !env.CDN_UPLOAD_URL) {
     throw new Error("CDN_PROVIDER=http requires CDN_UPLOAD_URL.");
+  }
+  if (env.CDN_PROVIDER === "unionstack" && !env.UNIONSTACK_API_KEY) {
+    throw new Error("CDN_PROVIDER=unionstack requires UNIONSTACK_API_KEY.");
   }
 
   return {
@@ -295,6 +300,8 @@ export function loadConfig(source = process.env) {
       timeoutMs: env.CDN_TIMEOUT_MS,
       maxRetries: env.CDN_MAX_RETRIES,
       filenamePrefix: env.CDN_FILENAME_PREFIX,
+      unionstackApiKey: env.UNIONSTACK_API_KEY,
+      unionstackApiDomain: env.UNIONSTACK_API_DOMAIN,
       localDir: env.LOCAL_CDN_DIR,
       publicBaseUrl: env.PUBLIC_BASE_URL.replace(/\/+$/, ""),
     },

@@ -1,11 +1,12 @@
 /**
  * Per-article pipeline:
  *   URL validation → metadata extraction → image validation → image processing
- *   → CDN upload → Supabase persistence → preview-ready card.
+ *   → local image store → Supabase persistence → preview-ready card.
  *
- * Each stage is persisted on the card so progress survives refreshes and restarts. Partial
- * results are always saved. Retries never repeat work that already succeeded: fields already
- * filled are kept, and an existing CDN image (or a cached upload of identical bytes) is reused.
+ * Images and logos are kept in the server's local store (`deps.cdn.local`) until an editor
+ * clicks "Convert to CDN" (convertToCdnFields). Each stage is persisted on the card so progress
+ * survives refreshes and restarts. Partial results are always saved. Retries never repeat work
+ * that already succeeded: fields already filled are kept.
  */
 import {
   CARD_VARIANT_KEYS,
@@ -43,7 +44,8 @@ export function finalStatus(card, blocked) {
 /** Uploads one asset unless an identical one (same cache key) is already on the CDN. */
 async function uploadOnce(deps, asset) {
   const cached = await deps.repo.getProcessedImage(asset.cacheKey);
-  if (cached) return cached.cdn_url;
+  // A cached upload from the local test CDN is not on the current CDN, so it is uploaded again.
+  if (cached && !deps.cdn.isForeignUrl?.(cached.cdn_url)) return cached.cdn_url;
   const uploaded = await deps.cdn.upload({
     buffer: asset.buffer,
     contentType: asset.contentType,
@@ -61,10 +63,24 @@ async function uploadOnce(deps, asset) {
   return uploaded.url;
 }
 
-/** Uploads a processed (Sharp) output under a content-derived, collision-resistant file name. */
-function uploadProcessed(deps, processed, prefix, sourceUrl) {
+/**
+ * Keeps an asset in the local store (the CDN itself when there is none, e.g. in tests) and
+ * returns its URL. File names are content-derived, so storing the same asset again is harmless.
+ */
+async function storeLocal(deps, asset) {
+  if (!deps.cdn.local) return uploadOnce(deps, asset);
+  const stored = await deps.cdn.local.upload({
+    buffer: asset.buffer,
+    contentType: asset.contentType,
+    filename: asset.filename,
+  });
+  return stored.url;
+}
+
+/** Stores a processed (Sharp) output under a content-derived, collision-resistant file name. */
+function storeProcessed(deps, processed, prefix, sourceUrl) {
   const hash = sha256(processed.cacheKey);
-  return uploadOnce(deps, {
+  return storeLocal(deps, {
     ...processed,
     hash,
     sourceUrl,
@@ -74,14 +90,13 @@ function uploadProcessed(deps, processed, prefix, sourceUrl) {
 
 /**
  * Validates an image and produces every card variant (large, medium, small), each cropped around
- * its own focus point when `focus` (the card's image_focus) has one, uploading each to
- * the CDN once. Variants already uploaded (e.g. before a partial failure) are reused from the
- * processed-image cache, so retries never create duplicate assets.
+ * its own focus point when `focus` (the card's image_focus) has one, and keeps them in the local
+ * store. Convert to CDN uploads them later.
  */
-export async function processAndUploadVariants(deps, buffer, sourceUrl, onStage, focus = null) {
+export async function processVariants(deps, buffer, sourceUrl, onStage, focus = null) {
   const sourceHash = sha256(buffer);
 
-  if (deps.cdn.inputMode === "url") {
+  if (deps.cdn.inputMode === "url" && !deps.cdn.local) {
     // A URL-ingesting CDN fetches the original itself, so it cannot receive three resized files.
     if (!sourceUrl)
       throw new PipelineError(
@@ -114,18 +129,20 @@ export async function processAndUploadVariants(deps, buffer, sourceUrl, onStage,
       focusFor(focus, key),
     );
 
-  await onStage?.("uploading");
+  if (!deps.cdn.local) await onStage?.("uploading");
   const variants = {};
   for (const key of CARD_VARIANT_KEYS) {
     const output = processed[key];
     variants[key] = {
-      url: await uploadProcessed(deps, output, deps.cdnFilenamePrefix, sourceUrl),
+      url: await storeProcessed(deps, output, deps.cdnFilenamePrefix, sourceUrl),
       width: output.width,
       height: output.height,
       // The photo inside any padding that was cut off, so the editor crops the same area.
       ...(output.content && { content: output.content }),
       // The automatic crop the server chose, so the editor shows it exactly and starts from it.
       ...(output.auto && { auto: output.auto }),
+      // The image's edge colour for this card's shape, shown by the editor's whole-image preview.
+      ...(output.edgeFill && { edgeFill: output.edgeFill }),
     };
   }
   const primary = processed[PRIMARY_VARIANT];
@@ -133,12 +150,12 @@ export async function processAndUploadVariants(deps, buffer, sourceUrl, onStage,
 }
 
 /**
- * Stores an uploaded original on the CDN as-is, so the card can be re-cropped later
- * (e.g. after the editor moves the focal point) without asking for the file again.
+ * Keeps an uploaded original as-is (locally until Convert to CDN), so the card can be re-cropped
+ * later (e.g. after the editor moves the focal point) without asking for the file again.
  */
-export async function uploadOriginal(deps, buffer, format) {
+export async function storeOriginal(deps, buffer, format) {
   const hash = sha256(buffer);
-  return uploadOnce(deps, {
+  return storeLocal(deps, {
     cacheKey: `${hash}:original`,
     buffer,
     contentType: `image/${format}`,
@@ -161,10 +178,10 @@ export function imageFields(result, source) {
   };
 }
 
-/** Converts a publisher logo and uploads it, reusing cached uploads of identical bytes. */
-export async function processAndUploadLogo(deps, buffer, sourceUrl) {
+/** Converts a publisher logo and keeps it in the local store until Convert to CDN. */
+export async function storeLogo(deps, buffer, sourceUrl) {
   const prefix = `${deps.cdnFilenamePrefix}-logo`;
-  if (deps.cdn.inputMode === "url") {
+  if (deps.cdn.inputMode === "url" && !deps.cdn.local) {
     const cacheKey = `${sha256(buffer)}:logo:url-ingest`;
     const hash = sha256(cacheKey);
     return uploadOnce(deps, {
@@ -177,7 +194,114 @@ export async function processAndUploadLogo(deps, buffer, sourceUrl) {
     });
   }
   const processed = await deps.images.processLogo(buffer);
-  return uploadProcessed(deps, processed, prefix, sourceUrl);
+  return storeProcessed(deps, processed, prefix, sourceUrl);
+}
+
+const CONTENT_TYPES = {
+  webp: "image/webp",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  avif: "image/avif",
+  gif: "image/gif",
+  heif: "image/heif",
+  tiff: "image/tiff",
+};
+
+/** Whether `url` is only in the local store, not on the CDN yet. */
+export function isLocalUrl(deps, url) {
+  return !!url && !!deps.cdn.isForeignUrl?.(url);
+}
+
+/** The card's images (all variants and the logo) that are still only stored locally. */
+export function localImageUrls(deps, card) {
+  return [
+    ...Object.values(card.image_variants ?? {}).map((v) => v?.url),
+    card.cdn_image_url,
+    card.cdn_publisher_logo_url,
+  ].filter((url) => isLocalUrl(deps, url));
+}
+
+/** Uploads one locally stored file to the CDN under the same name; cached uploads are reused. */
+async function uploadStored(deps, url) {
+  const buffer = await deps.cdn.read?.(url);
+  if (!buffer)
+    throw new PipelineError(
+      "IMAGE_INVALID",
+      "A locally stored image is missing. Process the card again (Retry), then convert it.",
+    );
+  const hash = sha256(buffer);
+  const filename = url.slice(url.lastIndexOf("/") + 1);
+  const ext = filename.slice(filename.lastIndexOf(".") + 1).toLowerCase();
+  return uploadOnce(deps, {
+    cacheKey: `${hash}:file`,
+    buffer,
+    contentType: CONTENT_TYPES[ext] ?? "application/octet-stream",
+    filename,
+    hash,
+    format: ext,
+  });
+}
+
+/** Asks a URL-ingesting CDN to fetch `sourceUrl` itself. */
+function ingestUrl(deps, sourceUrl, prefix) {
+  const hash = sha256(sourceUrl);
+  return uploadOnce(deps, {
+    cacheKey: `${hash}:url-ingest`,
+    buffer: Buffer.alloc(0),
+    contentType: "application/octet-stream",
+    filename: `${prefix}-${hash.slice(0, 20)}`,
+    hash,
+    sourceUrl,
+  });
+}
+
+/**
+ * Uploads every locally stored image of a card (variants, an uploaded original and the logo) to
+ * the CDN and returns the card fields with their CDN URLs. A URL-ingesting CDN fetches the
+ * article's original image (and logo) by URL instead, so it gets those URLs.
+ */
+export async function convertToCdnFields(deps, card) {
+  const patch = {};
+  const byUrl = deps.cdn.inputMode === "url";
+  const variants = card.image_variants ?? {};
+  const localVariants = CARD_VARIANT_KEYS.filter((key) => isLocalUrl(deps, variants[key]?.url));
+
+  if (localVariants.length && byUrl) {
+    const source = card.original_image_url;
+    if (!source || isLocalUrl(deps, source))
+      throw new PipelineError(
+        "CDN_UPLOAD_FAILED",
+        "This CDN ingests images by URL; uploaded files cannot be sent to it.",
+      );
+    const url = await ingestUrl(deps, source, deps.cdnFilenamePrefix);
+    patch.image_variants = Object.fromEntries(
+      CARD_VARIANT_KEYS.map((key) => [key, { url, width: null, height: null }]),
+    );
+  } else if (localVariants.length) {
+    const next = { ...variants };
+    for (const key of localVariants)
+      next[key] = { ...variants[key], url: await uploadStored(deps, variants[key].url) };
+    patch.image_variants = next;
+  }
+  if (!byUrl && isLocalUrl(deps, card.original_image_url))
+    patch.original_image_url = await uploadStored(deps, card.original_image_url);
+  if (patch.image_variants)
+    patch.cdn_image_url = patch.image_variants[PRIMARY_VARIANT]?.url ?? null;
+  else if (isLocalUrl(deps, card.cdn_image_url))
+    patch.cdn_image_url = await uploadStored(deps, card.cdn_image_url);
+
+  const logo = card.cdn_publisher_logo_url;
+  if (isLocalUrl(deps, logo)) {
+    if (!byUrl) patch.cdn_publisher_logo_url = await uploadStored(deps, logo);
+    else if (card.publisher_logo_url)
+      patch.cdn_publisher_logo_url = await ingestUrl(
+        deps,
+        card.publisher_logo_url,
+        `${deps.cdnFilenamePrefix}-logo`,
+      );
+  }
+  return patch;
 }
 
 /**
@@ -212,8 +336,12 @@ export function createPipeline(deps) {
     for (const [index, candidate] of candidates.entries()) {
       try {
         card = await update(card.id, { processing_stage: "validating_image" });
-        const downloaded = await deps.images.download(candidate);
-        const result = await processAndUploadVariants(
+        // The local test CDN reads its own files from disk; real URLs are downloaded.
+        const stored = await deps.cdn.read?.(candidate);
+        const downloaded = stored
+          ? { buffer: stored, info: await deps.images.inspect(stored) }
+          : await deps.images.download(candidate);
+        const result = await processVariants(
           deps,
           downloaded.buffer,
           candidate,
@@ -271,7 +399,7 @@ export function createPipeline(deps) {
       let cdnUrl = logoUploads.get(source);
       if (!cdnUrl) {
         const buffer = await deps.images.downloadLogo(source);
-        cdnUrl = await processAndUploadLogo(deps, buffer, source);
+        cdnUrl = await storeLogo(deps, buffer, source);
         logoUploads.set(source, cdnUrl);
       }
       return await update(card.id, { cdn_publisher_logo_url: cdnUrl });
@@ -375,8 +503,10 @@ export function createPipeline(deps) {
         correlationId,
       ));
       if (!imageError)
-        await event("images_uploaded", {
-          message: "Large, medium and small images are on the CDN.",
+        await event(deps.cdn.local ? "images_ready" : "images_uploaded", {
+          message: deps.cdn.local
+            ? "Large, medium and small images are ready (stored locally until Convert to CDN)."
+            : "Large, medium and small images are on the CDN.",
         });
     }
 

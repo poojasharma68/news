@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 function parseHash(hash) {
   const path = hash.replace(/^#/, "");
-  const card = /^\/cards\/([0-9a-f-]{36})$/i.exec(path);
-  if (card) return { name: "card", id: card[1] };
+  const card = /^\/cards\/([0-9a-f-]{36})(\/details)?$/i.exec(path);
+  if (card) return { name: card[2] ? "cardDetails" : "card", id: card[1] };
   if (path.startsWith("/library")) return { name: "library" };
   return { name: "dashboard" };
 }
