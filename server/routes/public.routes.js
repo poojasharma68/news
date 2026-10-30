@@ -3,6 +3,9 @@
  * an editor saved with "Save final changes", needs no sign-in, and can be called from any origin.
  *
  *   GET /api/public/news?limit=12&offset=0   live cards, newest article first
+ *   GET /api/public/news/large               the same, with only the standard card design
+ *   GET /api/public/news/medium              … only the feature card design
+ *   GET /api/public/news/small               … only the list card design
  *   GET /api/public/news/:id                 one live card
  *   GET /api/public/news.css                 the card CSS (for the `html` of each card)
  *   GET /api/public/embed.js                 drop-in script that renders cards into a page
@@ -11,6 +14,7 @@ import { Router } from "express";
 import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { CARD_CSS } from "../../shared/newsCardStyles.js";
+import { CARD_VARIANT_KEYS } from "../../shared/types.js";
 import { asyncHandler } from "../middleware/errorHandler.js";
 import { idParamSchema, validateParams, validateQuery } from "../middleware/validateUrl.js";
 
@@ -50,6 +54,18 @@ export function createPublicRouter(service) {
     }),
   );
 
+  // One card design only. Registered before /news/:id so "large" is not read as an id.
+  router.get(
+    `/news/:variant(${CARD_VARIANT_KEYS.join("|")})`,
+    validateQuery(listSchema),
+    asyncHandler(async (req, res) => {
+      const { variant } = req.params;
+      const data = await service.listLiveNews(res.locals.query);
+      res.setHeader("Cache-Control", CACHE);
+      res.json({ ...data, variant, items: data.items.map((item) => onlyVariant(item, variant)) });
+    }),
+  );
+
   router.get("/news.css", (_req, res) => {
     res.setHeader("Cache-Control", CACHE);
     res.type("text/css").send(CARD_CSS.trim());
@@ -70,6 +86,11 @@ export function createPublicRouter(service) {
   });
 
   return router;
+}
+
+/** A live card with only one design's image and HTML, e.g. `image` and `html` of "small". */
+function onlyVariant({ images, html, ...article }, variant) {
+  return { ...article, image: images?.[variant] ?? null, html: html?.[variant] ?? "" };
 }
 
 /**

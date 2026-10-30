@@ -347,6 +347,19 @@ describe("auth", () => {
     expect(item.html.large).toContain("First title");
     expect(item.html.small).toContain("488.webp");
 
+    // One design per route: only that design's image and HTML.
+    const small = await request(app).get("/api/public/news/small?limit=5").expect(200);
+    expect(small.body).toMatchObject({ total: 1, variant: "small" });
+    expect(small.body.items[0]).toMatchObject({ id: card.id, title: "First title" });
+    expect(small.body.items[0].image).toMatchObject({ width: 488, height: 340 });
+    expect(small.body.items[0].html).toBe(item.html.small);
+    expect(small.body.items[0]).not.toHaveProperty("images");
+    const medium = await request(app).get("/api/public/news/medium").expect(200);
+    expect(medium.body.items[0].html).toBe(item.html.medium);
+    const large = await request(app).get("/api/public/news/large").expect(200);
+    expect(large.body.items[0].image).toMatchObject({ width: 804, height: 392 });
+    await request(app).get("/api/public/news/huge").expect(400);
+
     // An edit is not live until it is approved and saved again.
     await request(app).patch(`/api/cards/${card.id}`).send({ title: "Second title" }).expect(200);
     let one = await request(app).get(`/api/public/news/${card.id}`).expect(200);

@@ -1,0 +1,10 @@
+node_modules
+dist
+dist-server
+dev-cdn-uploads
+coverage
+.git
+.env
+.env.*
+!.env.example
+*.log

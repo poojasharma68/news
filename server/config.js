@@ -186,7 +186,11 @@ function parseExtraFields(raw) {
 }
 
 export function loadConfig(source = process.env) {
-  const result = envSchema.safeParse(source);
+  // On Render, default the public URL to the service's own address instead of localhost.
+  const result = envSchema.safeParse({
+    ...source,
+    PUBLIC_BASE_URL: source.PUBLIC_BASE_URL || source.RENDER_EXTERNAL_URL,
+  });
   if (!result.success) {
     const issues = result.error.issues
       .map((i) => `  - ${i.path.join(".")}: ${i.message}`)

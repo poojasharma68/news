@@ -1,0 +1,41 @@
+# Render Blueprint: one Docker web service running the API and the dashboard.
+# Values marked `sync: false` are entered in the Render dashboard when the Blueprint is created.
+services:
+  - type: web
+    name: mu-news-cards
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    # The queue lives in this process: keep exactly one instance.
+    numInstances: 1
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SERVE_CLIENT
+        value: "true"
+      - key: TRUST_PROXY
+        value: "1"
+      - key: AUTH_MODE
+        value: supabase
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+      - key: CDN_PROVIDER
+        value: unionstack
+      - key: UNIONSTACK_API_DOMAIN
+        sync: false
+      - key: UNIONSTACK_API_KEY
+        sync: false
+      - key: BROWSER_FALLBACK_ENABLED
+        value: "true"
+      - key: BROWSER_MAX_PAGES
+        value: "1"
